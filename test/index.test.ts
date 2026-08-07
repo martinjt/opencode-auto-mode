@@ -185,6 +185,93 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(1)
   })
 
+  test("statically permits a safe && chain of individually-safe commands", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "pwd && whoami && date" })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("statically permits a safe ; chain of individually-safe commands", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "pwd; whoami" })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("falls back to the reviewer when one piece of a && chain is not statically safe", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "pwd && curl https://example.com" })
+
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("does not statically allow a && chain with an unknown appended command", async () => {
+    const { hooks, state } = await makeHooks("BLOCK: appended command is outside the static exception")
+
+    await expect(executeBefore(hooks, "bash", { command: "ls && rm -rf /tmp/whatever" })).rejects.toThrow(
+      "Auto-reviewer blocked bash",
+    )
+
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("statically permits ls with a workspace-relative path argument", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "ls src/components" })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("statically permits a safe && chain that needs the widened ls path pattern", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "ls src && ls test" })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("statically permits git status with a workspace-relative path argument", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "git status src" })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("still routes a ~-prefixed path to the reviewer even though the command shape is otherwise safe", async () => {
+    const { hooks, state } = await makeHooks()
+
+    // `~` paths are unconditionally treated as external to the workspace (canonicalizeTarget),
+    // and staticToolDecision refuses to statically allow anything touching an external/ambiguous
+    // path -- widening AUTO_PERMITTED for path arguments must not bypass that boundary.
+    await executeBefore(hooks, "bash", { command: "ls ~/.dotnet/dotnet && ~/.dotnet/dotnet --version" })
+
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("does not treat a dynamic-expansion argument as a plain path for ls", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await expect(executeBefore(hooks, "bash", { command: "ls $(whoami)" })).rejects.toThrow(
+      "Auto-reviewer blocked bash",
+    )
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("does not treat an unrecognized long flag as a plain path for ls", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "ls --recursive-delete-everything" })
+
+    expect(state.promptCalls).toBe(1)
+  })
+
   test("hard-blocks privilege escalation without calling the model", async () => {
     const { hooks, state } = await makeHooks()
 

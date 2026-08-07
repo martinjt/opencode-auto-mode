@@ -93,10 +93,16 @@ const STATICALLY_ALLOWED_TOOLS = new Set([
   "question",
 ])
 
+// A single shell-metacharacter-free argument token that doesn't start with `-`, so a
+// disguised/unknown flag can never sneak through as a "path" -- real flags must match an
+// explicit flag alternative instead. Reused everywhere a hand-written or learned pattern
+// needs to accept a trailing path argument without widening what counts as safe.
+const SAFE_PATH_ARG_SOURCE = String.raw`(?:\s+(?!-)[^\s;&|<>` + "`" + String.raw`$()]+)*`
+
 const AUTO_PERMITTED = [
-  /^(ls|dir)\s*(?:-[A-Za-z]+)?\s*$/i,
+  new RegExp(String.raw`^(ls|dir)(?:\s+-[A-Za-z]+)*${SAFE_PATH_ARG_SOURCE}\s*$`, "i"),
   /^cd(?:\s+[^;&|\r\n]+)?\s*$/i,
-  /^git\s+status(?:\s+(?:--short|--porcelain(?:=v[12])?|-s|-b))*\s*$/i,
+  new RegExp(String.raw`^git\s+status(?:\s+(?:--short|--porcelain(?:=v[12])?|-s|-b))*${SAFE_PATH_ARG_SOURCE}\s*$`, "i"),
   /^git\s+rev-parse(?:\s+--[A-Za-z-]+|\s+[^;&|\r\n]+)*\s*$/i,
   /^git\s+branch\s*$/i,
   /^git\s+branch\s+(?:--list|-l|--show-current|-a|-r|-v|-vv)\s*$/i,
@@ -919,16 +925,32 @@ function analyzeCommand(command: string): Analysis {
   return { behaviors: [...new Set(behaviors)] }
 }
 
+// Operators that disqualify a command from static allow-listing no matter how it's chained:
+// redirects, command substitution/grouping, and a lone (non-`||`) pipe. `&&`, `;`, `&`, and
+// `||` are deliberately excluded here -- defeatsAutoPermit() and splitSafeCompoundCommand()
+// each apply their own, different rules for those, since `&&`/`;` chaining of otherwise-safe
+// commands is exactly what splitSafeCompoundCommand() is allowed to permit.
+const SHELL_CONTROL_OPERATORS = /[\r\n]|(?:>>|[0-9]?>(?!>))|`|\$\(|[<>]\(|(?<!\|)\|(?!\|)/
+
 function defeatsAutoPermit(command: string): boolean {
-  if (/[\r\n]/.test(command)) return true
-  if (/(?:>>|[0-9]?>(?!>))/.test(command)) return true
-  if (/`|\$\(/.test(command)) return true
-  if (/[<>]\(/.test(command)) return true
-  if (/(?<!\|)\|(?!\|)/.test(command)) return true
+  if (SHELL_CONTROL_OPERATORS.test(command)) return true
   if (SECRET_ENV_VAR.test(command)) return true
   if (/&/.test(command)) return true
   if (/;|\|\|/.test(command)) return true
   return false
+}
+
+// Splits a command into sub-commands ONLY if `&&`/`;` are the sole separators present --
+// any pipe, `||`, background `&`, redirect, backtick/`$()`, or newline anywhere in the
+// command disqualifies the whole thing, same as a single non-compound command would be
+// disqualified. Returns null (not compound-safe) rather than a single-element array.
+function splitSafeCompoundCommand(command: string): string[] | null {
+  if (SHELL_CONTROL_OPERATORS.test(command)) return null
+  if (/\|\|/.test(command)) return null
+  if (/(?<!&)&(?!&)/.test(command)) return null
+  const parts = command.split(/&&|;/).map((part) => part.trim())
+  if (parts.length < 2 || parts.some((part) => !part)) return null
+  return parts
 }
 
 function staticDecision(command: string, permission: string, analysis: Analysis): Decision | null {
@@ -938,6 +960,15 @@ function staticDecision(command: string, permission: string, analysis: Analysis)
   if (permission !== "bash" || analysis.behaviors.length > 0) return null
   if (AUTO_PERMITTED_COMPOUND.some((pattern) => pattern.test(command))) {
     return { allowed: true, reason: "conservative read-only command", source: "static-allow" }
+  }
+  const compoundParts = splitSafeCompoundCommand(command)
+  if (compoundParts) {
+    const allSafe = compoundParts.every(
+      (part) => !defeatsAutoPermit(part) && AUTO_PERMITTED.some((pattern) => pattern.test(part)),
+    )
+    return allSafe
+      ? { allowed: true, reason: "conservative read-only command sequence", source: "static-allow" }
+      : null
   }
   if (defeatsAutoPermit(command)) return null
   if (AUTO_PERMITTED.some((pattern) => pattern.test(command))) {
