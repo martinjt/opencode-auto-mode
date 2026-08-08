@@ -31,7 +31,7 @@ function makeShell(outputs: string[] = []) {
 }
 
 async function makeHooks(
-  reviewerText = "ALLOW: authorized test operation",
+  reviewerText: string | string[] = "ALLOW: authorized test operation",
   userMessages: string[] = [],
   directory = "/workspace/project",
   priorCommands: string[] = [],
@@ -74,9 +74,11 @@ async function makeHooks(
       prompt: async (request: { body?: { parts?: Array<{ text?: string }> } }) => {
         state.promptCalls += 1
         state.reviewerRequests.push(request.body?.parts?.[0]?.text ?? "")
+        const responses = Array.isArray(reviewerText) ? reviewerText : [reviewerText]
+        const text = responses[Math.min(state.promptCalls, responses.length) - 1]
         return {
           data: {
-            parts: [{ type: "text", text: reviewerText }],
+            parts: [{ type: "text", text }],
           },
         }
       },
@@ -140,6 +142,7 @@ describe("configuration", () => {
         },
         "auto-reviewer": {
           hidden: true,
+          steps: 3,
           permission: { "*": "deny" },
           model: "openai/test-model",
         },
@@ -318,12 +321,14 @@ describe("pre-execution review", () => {
   })
 
   test("rejects an ALLOW decision embedded in a multiline response", async () => {
+    // Unparseable responses are retried once against a fresh reviewer session (REVIEW_MAX_ATTEMPTS)
+    // before giving up -- the mock always returns the same malformed text, so both attempts fail.
     const { hooks, state } = await makeHooks("Commentary before decision\nALLOW: unsafe response shape")
 
     await expect(executeBefore(hooks, "bash", { command: "printf test" })).rejects.toThrow(
       "Auto-reviewer unavailable",
     )
-    expect(state.promptCalls).toBe(1)
+    expect(state.promptCalls).toBe(2)
   })
 
   test.each(["\v", "\f", "\u0085", "\u2028", "\u2029"])(
@@ -334,9 +339,30 @@ describe("pre-execution review", () => {
       await expect(executeBefore(hooks, "bash", { command: "printf test" })).rejects.toThrow(
         "Auto-reviewer unavailable",
       )
-      expect(state.promptCalls).toBe(1)
+      expect(state.promptCalls).toBe(2)
     },
   )
+
+  test("recovers a transient unparseable response by retrying against a fresh session", async () => {
+    const { hooks, state } = await makeHooks([
+      "CRITICAL - MAXIMUM STEPS REACHED\n\nRespond with text only.",
+      "ALLOW: clean verdict on retry",
+    ])
+
+    await executeBefore(hooks, "bash", { command: "printf test" })
+
+    expect(state.promptCalls).toBe(2)
+  })
+
+  test("still blocks after exhausting retries on a persistently unparseable response", async () => {
+    const { hooks, state } = await makeHooks("CRITICAL - MAXIMUM STEPS REACHED\n\nRespond with text only.")
+
+    await expect(executeBefore(hooks, "bash", { command: "printf test" })).rejects.toThrow(
+      "Auto-reviewer unavailable",
+    )
+
+    expect(state.promptCalls).toBe(2)
+  })
 
   test.each(["git branch -a --unset-upstream main", "git stash list --output=/outside/project/result"])(
     "reviews Git commands with potentially mutating options: %s",

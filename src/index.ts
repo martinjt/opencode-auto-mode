@@ -9,6 +9,8 @@ const REVIEWER_AGENT = "auto-reviewer"
 const DEFAULT_REVIEW_TIMEOUT_MS = 60_000
 const CONTEXT_TIMEOUT_MS = 3_000
 const CACHE_TTL_MS = 60_000
+const REVIEWER_AGENT_STEPS = 3
+const REVIEW_MAX_ATTEMPTS = 2
 const USER_CONTEXT_MAX_CHARS = 4_000
 const REVIEWER_PROMPT_URL = new URL("./auto-reviewer-prompt.md", import.meta.url)
 
@@ -1040,9 +1042,15 @@ ${commandJson}
 Return exactly one line: ALLOW: <reason> or BLOCK: <reason>.`
 }
 
+// Distinguishes "the model didn't produce a parseable verdict" (worth one retry against a
+// fresh reviewer session -- often a transient model hiccup) from other reviewWithLLM failures
+// like a timeout or a session-create error (not retried; those aren't likely to resolve on an
+// immediate second attempt and retrying just doubles the wait before failing anyway).
+class UnparseableReviewError extends Error {}
+
 function parseDecision(text: string): { allowed: boolean; reason: string } {
   const match = text.trim().match(/^(ALLOW|BLOCK):[ \t]+([^\x00-\x1f\x7f-\x9f\u2028\u2029]+)$/i)
-  if (!match?.[1] || !match[2]) throw new Error(`Reviewer response was unclear: ${truncate(text, 200)}`)
+  if (!match?.[1] || !match[2]) throw new UnparseableReviewError(`Reviewer response was unclear: ${truncate(text, 200)}`)
   return { allowed: match[1].toUpperCase() === "ALLOW", reason: truncate(match[2].trim(), 300) }
 }
 
@@ -1103,16 +1111,14 @@ export default (async ({ client, directory, $ }, options) => {
     }
   }
 
-  async function reviewWithLLM(
+  async function attemptReviewWithLLM(
     command: string,
     permission: string,
     sessionID: string,
-    callID: string | undefined,
+    context: ReviewContext,
+    model: ModelRef | undefined,
     analysis: Analysis,
   ): Promise<Decision> {
-    await notify(`Reviewing: ${truncate(command, 120)}`, "info")
-    const context = await gatherContext(client, $, directory, sessionID, callID)
-    const model = configuredModel ?? context.model ?? fallbackModel
     const created = await client.session.create({
       body: { parentID: sessionID, title: `Auto review: ${truncate(command, 60)}` },
     })
@@ -1164,6 +1170,32 @@ export default (async ({ client, directory, $ }, options) => {
         // Reviewer sessions are disposable and cleanup is best effort.
       }
     }
+  }
+
+  async function reviewWithLLM(
+    command: string,
+    permission: string,
+    sessionID: string,
+    callID: string | undefined,
+    analysis: Analysis,
+  ): Promise<Decision> {
+    await notify(`Reviewing: ${truncate(command, 120)}`, "info")
+    const context = await gatherContext(client, $, directory, sessionID, callID)
+    const model = configuredModel ?? context.model ?? fallbackModel
+
+    for (let attempt = 1; attempt <= REVIEW_MAX_ATTEMPTS; attempt++) {
+      try {
+        return await attemptReviewWithLLM(command, permission, sessionID, context, model, analysis)
+      } catch (error) {
+        if (!(error instanceof UnparseableReviewError) || attempt === REVIEW_MAX_ATTEMPTS) throw error
+        await log("warn", "Reviewer response was unparseable; retrying against a fresh session", {
+          command: truncate(command, 200),
+          attempt,
+          error: errorMessage(error),
+        })
+      }
+    }
+    throw new Error("unreachable")
   }
 
   async function decide(
@@ -1279,7 +1311,12 @@ export default (async ({ client, directory, $ }, options) => {
           description: "Hidden tool-free agent that reviews OpenCode tool invocations.",
           mode: "subagent",
           hidden: true,
-          steps: 1,
+          // >1 so opencode doesn't treat the model's first (and only, under permission "deny")
+          // generation as its forced-final turn -- that injects a "MAXIMUM STEPS REACHED,
+          // respond with text only" prefix that small/fast models tend to echo back verbatim
+          // instead of producing ALLOW:/BLOCK:. The agent still can't call any tool regardless
+          // of step count (permission "*": "deny" below), so this grants no new capability.
+          steps: REVIEWER_AGENT_STEPS,
           permission: { "*": "deny" } as never,
           prompt: reviewerPrompt,
           ...(configuredModelSpec ? { model: configuredModelSpec } : {}),
