@@ -987,6 +987,60 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(0)
   })
 
+  test("statically allows adding known dev-tooling routes to staticwebapp.config.json", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "edit", {
+      filePath: "apps/frontend/public/staticwebapp.config.json",
+      oldString: `    { "route": "/assets/*", "allowedRoles": ["anonymous"] },`,
+      newString:
+        `    { "route": "/assets/*", "allowedRoles": ["anonymous"] },\n` +
+        `    { "route": "/@vite/*", "allowedRoles": ["anonymous"] },\n` +
+        `    { "route": "/@react-refresh", "allowedRoles": ["anonymous"] },\n` +
+        `    { "route": "/@fs/*", "allowedRoles": ["anonymous"] },`,
+    })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("statically allows adding known dev-tooling paths to a navigationFallback exclude list", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "edit", {
+      filePath: "apps/frontend/public/staticwebapp.config.json",
+      oldString: `      "/assets/*",`,
+      newString: `      "/assets/*",\n      "/@vite/*",\n      "/node_modules/*"`,
+    })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("does not statically allow adding an unrecognized route to staticwebapp.config.json", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "edit", {
+      filePath: "apps/frontend/public/staticwebapp.config.json",
+      oldString: `    { "route": "/assets/*", "allowedRoles": ["anonymous"] },`,
+      newString:
+        `    { "route": "/assets/*", "allowedRoles": ["anonymous"] },\n` +
+        `    { "route": "/api/admin/*", "allowedRoles": ["anonymous"] },`,
+    })
+
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("does not statically allow the same dev-tooling route text in an unrelated file", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "edit", {
+      filePath: "apps/frontend/vite.config.ts",
+      oldString: `export default {}`,
+      newString: `export default { route: "/@vite/*", allowedRoles: ["anonymous"] }`,
+    })
+
+    expect(state.promptCalls).toBe(1)
+  })
+
   test("fails closed for incomplete permission.ask commands", async () => {
     const { hooks, state } = await makeHooks()
     const output = { status: "ask" }

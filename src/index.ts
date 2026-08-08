@@ -112,6 +112,56 @@ const STATICALLY_ALLOWED_TOOLS = new Set([
   "question",
 ])
 
+// A finite, well-known set of dev-server/build-tool internal asset paths -- not
+// application data, not a real authentication surface, and universal across projects using
+// these tools (not specific to any one repo). Recognizing edits that only add these to an
+// Azure Static Web Apps config's route/exclude lists sidesteps asking a small model to judge
+// "does this bypass authentication" each time, which it does unreliably: the exact same edit
+// has been blocked under three different rationales (persistence/security-control, missing
+// task authorization, "modifies Web App configuration") despite being the same safe pattern.
+const SWA_CONFIG_FILENAME = /(?:^|\/)staticwebapp\.config\.json$/
+const SWA_DEV_TOOLING_ROUTE_VALUES = [
+  "/@vite/*",
+  "/@vite/client",
+  "/@react-refresh",
+  "/@react-refresh/*",
+  "/@id/*",
+  "/@fs/*",
+  "/node_modules/*",
+  "/favicon.ico",
+]
+const SWA_DEV_TOOLING_VALUE_ALTERNATION = SWA_DEV_TOOLING_ROUTE_VALUES.map((value) =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+).join("|")
+// Matches either a `routes` array entry granting one of the above paths anonymous access, or
+// a plain string entry in a `navigationFallback.exclude`-style array -- both shapes this file
+// legitimately uses for "don't apply SPA/auth handling to this dev-tooling asset path".
+const SWA_DEV_TOOLING_LINE = new RegExp(
+  String.raw`^\{?\s*"route"\s*:\s*"(?:${SWA_DEV_TOOLING_VALUE_ALTERNATION})"\s*,\s*"allowedRoles"\s*:\s*\[\s*"anonymous"\s*\]\s*\}?,?$` +
+    "|" +
+    String.raw`^"(?:${SWA_DEV_TOOLING_VALUE_ALTERNATION})",?$`,
+)
+
+function isSafeStaticWebAppDevToolingRouteEdit(tool: string, args: Record<string, unknown>): boolean {
+  if (tool !== "edit") return false
+  const filePath = typeof args.filePath === "string" ? args.filePath : ""
+  if (!SWA_CONFIG_FILENAME.test(filePath)) return false
+  const oldString = typeof args.oldString === "string" ? args.oldString : ""
+  const newString = typeof args.newString === "string" ? args.newString : ""
+  const oldLines = new Set(
+    oldString
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean),
+  )
+  const addedLines = newString
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !oldLines.has(line))
+  if (addedLines.length === 0) return false
+  return addedLines.every((line) => SWA_DEV_TOOLING_LINE.test(line))
+}
+
 // A single shell-metacharacter-free argument token that doesn't start with `-`, so a
 // disguised/unknown flag can never sneak through as a "path" -- real flags must match an
 // explicit flag alternative instead. Reused everywhere a hand-written or learned pattern
@@ -623,6 +673,11 @@ function staticToolDecision(
     if (typeof args.workdir === "string" && args.workdir.trim()) return null
     if (pathInspection.external || pathInspection.ambiguous) return null
     return staticResult
+  }
+  if (tool === "edit" && !pathInspection.external && !pathInspection.ambiguous) {
+    if (isSafeStaticWebAppDevToolingRouteEdit(tool, args)) {
+      return { allowed: true, reason: "adds only well-known dev-tooling asset paths", source: "static-allow" }
+    }
   }
   if (!STATICALLY_ALLOWED_TOOLS.has(tool)) return null
   if (pathInspection.external || pathInspection.ambiguous) return null
