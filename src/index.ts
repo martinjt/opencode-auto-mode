@@ -191,6 +191,14 @@ const AUTO_PERMITTED = [
   /^(uname|id)(?:\s+-[A-Za-z]+)?\s*$/i,
   /^date(?:\s+\+\S+)?\s*$/i,
   /^(python3?|node|uv|tsx|npx)\s+(--version|-v|--help|-h)$/i,
+  // Generic, tool-agnostic: virtually every CLI (docker, aspire, kubectl, pulumi, func, git,
+  // npm, ...) supports these as read-only, non-mutating queries by convention. Recognizing the
+  // *shape* here means a new tool the agent happens to invoke doesn't need its own hand-added
+  // entry -- the alternative is enumerating every binary name a project might use, which never
+  // converges (this file has already grown one entry at a time for dotnet, aspire, docker...).
+  // Deliberately bare-form only (single diagnostic word, nothing else): a command carrying
+  // extra flags, formatting, or output redirection still falls through to LLM review as before.
+  /^[A-Za-z][A-Za-z0-9._-]*\s+(?:--version|-v|-V|--help|-h|info|status|version|ps|list)\s*$/i,
 ]
 
 const AUTO_PERMITTED_COMPOUND = [

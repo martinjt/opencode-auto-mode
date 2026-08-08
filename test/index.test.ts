@@ -396,6 +396,49 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(1)
   })
 
+  test.each([
+    "docker info",
+    "docker ps",
+    "docker version",
+    "aspire --version",
+    "kubectl version",
+    "pulumi version",
+    "func --version",
+    "helm version",
+    "terraform --version",
+  ])("statically permits the generic read-only diagnostic form: %s", async (command) => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("statically permits a && chain of generic diagnostic commands from different tools", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "docker --version && aspire --version && kubectl version" })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("does not statically permit a diagnostic command with extra flags or formatting", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "docker info --format '{{.ServerVersion}}'" })
+
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("does not let the generic diagnostic pattern bypass the sudo hard block", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await expect(executeBefore(hooks, "bash", { command: "sudo --version" })).rejects.toThrow(
+      "privilege escalation",
+    )
+    expect(state.promptCalls).toBe(0)
+  })
+
   test("still routes a ~-prefixed path to the reviewer even though the command shape is otherwise safe", async () => {
     const { hooks, state } = await makeHooks()
 
