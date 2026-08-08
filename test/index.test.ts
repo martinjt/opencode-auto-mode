@@ -153,6 +153,24 @@ describe("configuration", () => {
     expect(reviewer?.prompt).toContain("lockfile alone is not evidence of trust")
     expect(reviewer?.prompt).toContain("Never infer external scope from a development workflow")
   })
+
+  test("forces deterministic decoding for the reviewer agent only", async () => {
+    const { hooks } = await makeHooks()
+
+    const reviewerOutput = { temperature: 0.7, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} }
+    await hooks["chat.params"]?.(
+      { sessionID: "s", agent: "auto-reviewer", model: {} as never, provider: {} as never, message: {} as never },
+      reviewerOutput as never,
+    )
+    expect(reviewerOutput.temperature).toBe(0)
+
+    const buildOutput = { temperature: 0.7, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} }
+    await hooks["chat.params"]?.(
+      { sessionID: "s", agent: "build", model: {} as never, provider: {} as never, message: {} as never },
+      buildOutput as never,
+    )
+    expect(buildOutput.temperature).toBe(0.7)
+  })
 })
 
 describe("pre-execution review", () => {

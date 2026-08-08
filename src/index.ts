@@ -1323,6 +1323,14 @@ export default (async ({ client, directory, $ }, options) => {
         },
       }
     },
+    // The reviewer is a judgment task, not a creative one -- we want the same command to get
+    // the same verdict every time, not sampling variance. Forcing greedy decoding removes that
+    // one axis of inconsistency; it doesn't fix verdicts drifting because the *context* changes
+    // between calls (see gatherContext), only ones caused by pure model sampling.
+    "chat.params": async (input, output) => {
+      if (input.agent !== REVIEWER_AGENT) return
+      output.temperature = 0
+    },
     "tool.execute.before": async (input, output) => {
       const args = output.args && typeof output.args === "object" ? (output.args as Record<string, unknown>) : {}
       const analysis = analyzeTool(input.tool, args)
