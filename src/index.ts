@@ -110,7 +110,15 @@ const STATICALLY_ALLOWED_TOOLS = new Set([
   "skill",
   "todowrite",
   "question",
+  // Reading a project file is fundamentally lower risk than executing a command -- it can't
+  // mutate state, and the external/ambiguous-path check above still applies regardless of
+  // this. isSensitiveEnvFile() below keeps .env-shaped files out of this fast path.
+  "read",
 ])
+
+function isSensitiveEnvFile(name: string): boolean {
+  return name === ".env" || (name.startsWith(".env.") && name !== ".env.example")
+}
 
 // A finite, well-known set of dev-server/build-tool internal asset paths -- not
 // application data, not a real authentication surface, and universal across projects using
@@ -188,6 +196,28 @@ const AUTO_PERMITTED = [
 const AUTO_PERMITTED_COMPOUND = [
   /^(?:source|\.)\s+(?:\.\/)?\.venv\/bin\/activate\s*&&\s*gh\s+pr\s+view(?:\s+\d+)?\s+--json\s+[A-Za-z][A-Za-z0-9]*(?:,[A-Za-z][A-Za-z0-9]*)*\s*$/i,
 ]
+
+// Single-target, read-only file inspection commands. Deliberately narrower than
+// AUTO_PERMITTED_TOOLS' path-arg patterns above: exactly one target (not "zero or more", so a
+// bare `cat` that would block waiting on stdin never matches), and isSensitiveEnvFile() keeps
+// .env-shaped targets out of this fast path exactly like the read tool. External/ambiguous
+// paths are still excluded by the existing check in staticToolDecision regardless.
+const SAFE_READ_COMMANDS = [
+  new RegExp(String.raw`^cat\s+(?!-)([^\s;&|<>` + "`" + String.raw`$()]+)\s*$`, "i"),
+  new RegExp(String.raw`^(?:file|stat)\s+(?!-)([^\s;&|<>` + "`" + String.raw`$()]+)\s*$`, "i"),
+  new RegExp(String.raw`^wc(?:\s+-[lcw]+)?\s+(?!-)([^\s;&|<>` + "`" + String.raw`$()]+)\s*$`, "i"),
+  new RegExp(String.raw`^(?:head|tail)(?:\s+-[cn]\s*\d+)?\s+(?!-)([^\s;&|<>` + "`" + String.raw`$()]+)\s*$`, "i"),
+]
+
+function isSafeBashFileRead(command: string): boolean {
+  for (const pattern of SAFE_READ_COMMANDS) {
+    const match = command.match(pattern)
+    if (!match?.[1]) continue
+    const target = match[1].replace(/^(['"])(.*)\1$/, "$2")
+    return Boolean(target) && !isSensitiveEnvFile(basename(target))
+  }
+  return false
+}
 
 const AUTO_BLOCKED: Array<{ pattern: RegExp; reason: string }> = [
   {
@@ -697,8 +727,7 @@ function staticToolDecision(
   }
   if (tool === "read") {
     const filePath = typeof args.filePath === "string" ? args.filePath : ""
-    const name = basename(filePath)
-    if (name === ".env" || (name.startsWith(".env.") && name !== ".env.example")) return null
+    if (isSensitiveEnvFile(basename(filePath))) return null
   }
   return { allowed: true, reason: `conservative local read-only ${tool} operation`, source: "static-allow" }
 }
@@ -1045,14 +1074,15 @@ function staticDecision(command: string, permission: string, analysis: Analysis)
   const compoundParts = splitSafeCompoundCommand(command)
   if (compoundParts) {
     const allSafe = compoundParts.every(
-      (part) => !defeatsAutoPermit(part) && AUTO_PERMITTED.some((pattern) => pattern.test(part)),
+      (part) =>
+        !defeatsAutoPermit(part) && (AUTO_PERMITTED.some((pattern) => pattern.test(part)) || isSafeBashFileRead(part)),
     )
     return allSafe
       ? { allowed: true, reason: "conservative read-only command sequence", source: "static-allow" }
       : null
   }
   if (defeatsAutoPermit(command)) return null
-  if (AUTO_PERMITTED.some((pattern) => pattern.test(command))) {
+  if (AUTO_PERMITTED.some((pattern) => pattern.test(command)) || isSafeBashFileRead(command)) {
     return { allowed: true, reason: "conservative read-only command", source: "static-allow" }
   }
   return null

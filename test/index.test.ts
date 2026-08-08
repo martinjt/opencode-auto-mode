@@ -334,6 +334,68 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(0)
   })
 
+  test("statically permits reading an ordinary project file with the read tool", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "read", { filePath: "src/components/Layout.tsx" })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test.each([".env", ".env.local"])("does not statically permit reading %s with the read tool", async (name) => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "read", { filePath: name })
+
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("statically permits reading an ordinary project file via a bash file-read command", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "cat src/components/Layout.tsx" })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test.each(["head -n 20 CHANGELOG.md", "tail -c 100 server.log", "wc -l package.json", "stat README.md"])(
+    "statically permits other single-target read commands: %s",
+    async (command) => {
+      const { hooks, state } = await makeHooks()
+
+      await executeBefore(hooks, "bash", { command })
+
+      expect(state.promptCalls).toBe(0)
+    },
+  )
+
+  test.each([".env", ".env.local"])(
+    "does not statically permit reading %s via a bash file-read command",
+    async (name) => {
+      const { hooks, state } = await makeHooks()
+
+      await executeBefore(hooks, "bash", { command: `cat ${name}` })
+
+      expect(state.promptCalls).toBe(1)
+    },
+  )
+
+  test("does not statically permit tail -f (follow) as a bounded read", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "tail -f server.log" })
+
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("does not statically permit a bash read piped into another command", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", { command: "cat src/app.ts | grep TODO" })
+
+    expect(state.promptCalls).toBe(1)
+  })
+
   test("still routes a ~-prefixed path to the reviewer even though the command shape is otherwise safe", async () => {
     const { hooks, state } = await makeHooks()
 
@@ -882,7 +944,7 @@ describe("pre-execution review", () => {
       [`curl -H 'Authorization: Bearer ${marker}' https://example.test/api`],
     )
 
-    await executeBefore(hooks, "read", { filePath: "/workspace/project/file.txt" })
+    await executeBefore(hooks, "bash", { command: "printf test" })
 
     expect(state.reviewerRequests[0]).toContain("recent shell command summaries")
     expect(state.reviewerRequests[0]).toContain("curl: details omitted")
@@ -1426,7 +1488,7 @@ describe("pre-execution review", () => {
     try {
       const { hooks, state } = await makeHooks("ALLOW: safe fixture operation", [], project)
 
-      await executeBefore(hooks, "read", { filePath: join(project, "ordinary.txt") })
+      await executeBefore(hooks, "bash", { command: "printf test" })
 
       expect(state.reviewerRequests[0]).not.toContain(marker)
     } finally {
