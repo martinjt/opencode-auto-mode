@@ -135,6 +135,32 @@ The plugin accepts these options in the second element of the plugin tuple:
 | `enabled` | boolean | `true` | Enables or disables every plugin hook and configuration change. |
 | `model` | string | Context-dependent | Reviewer model in `provider/model` format. |
 | `timeoutMs` | number | `60000` | LLM review timeout. Values are clamped between 1,000 and 300,000 milliseconds. |
+| `mode` | `"review-all"` \| `"native-ask-only"` | `"review-all"` | See [Review Mode](#review-mode). |
+
+### Review Mode
+
+- **`review-all`** (default): native permission is rewritten so everything resolves to `allow`, and the plugin reviews every tool call itself. This is the original behavior -- maximum coverage, at the cost of reviewing things a plain OpenCode permission config would have auto-allowed anyway.
+- **`native-ask-only`**: native permission config is left exactly as configured. Anything it already resolves to `allow` bypasses the plugin entirely -- no LLM call, no latency. Anything it resolves to `ask` is what the plugin actually reviews (via `permission.ask`), matching what a human would have been prompted for under a plain OpenCode setup. A small set of always-on hard blocks (`sudo`, `rm -rf /`, `mkfs`, dynamic shell expansion, etc.) still apply in `tool.execute.before` regardless of mode.
+
+Set the global default in your installation's plugin tuple:
+
+```json
+{
+  "enabled": true,
+  "model": "provider/model-id",
+  "mode": "native-ask-only"
+}
+```
+
+Override it per project by adding a top-level `auto-mode` block to that project's `opencode.json`/`opencode.jsonc` (merged with global config by OpenCode):
+
+```json
+{
+  "auto-mode": { "mode": "review-all" }
+}
+```
+
+The project-level override always wins over the global plugin option.
 
 ### Enable or Disable
 
@@ -307,7 +333,9 @@ Do not use `OPENCODE_PURE=1` for normal work. It intentionally disables all exte
 
 ### A Native Permission Prompt Still Appears
 
-Restart OpenCode first. The plugin changes resolved `ask` actions to `allow` and performs enforcement in `tool.execute.before`. Explicit `deny` rules remain denied. If a prompt persists, inspect per-agent rules with `opencode debug agent <name>` and confirm the plugin loaded from the expected location.
+If `mode` is `"native-ask-only"`, this is expected -- it's the point of that mode. The plugin only auto-answers what it can safely decide; anything it can't (or a tool type it doesn't yet handle well) falls through to a real native prompt.
+
+In the default `"review-all"` mode, restart OpenCode first. The plugin changes resolved `ask` actions to `allow` and performs enforcement in `tool.execute.before`. Explicit `deny` rules remain denied. If a prompt persists, inspect per-agent rules with `opencode debug agent <name>` and confirm the plugin loaded from the expected location.
 
 ## Development
 

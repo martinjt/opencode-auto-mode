@@ -11,6 +11,23 @@ const CONTEXT_TIMEOUT_MS = 3_000
 const CACHE_TTL_MS = 60_000
 const REVIEWER_AGENT_STEPS = 3
 const REVIEW_MAX_ATTEMPTS = 2
+
+// "review-all" (default): current behavior -- native permission is rewritten to allow
+// everything, and tool.execute.before is the sole authority for every tool call.
+// "native-ask-only": leaves native permission config untouched, so the plugin only reviews
+// what native permission would actually resolve to "ask" -- everything native already
+// resolves to "allow" bypasses the plugin (and any hidden LLM cost/latency) entirely.
+type PluginMode = "review-all" | "native-ask-only"
+const PLUGIN_MODES: ReadonlySet<string> = new Set(["review-all", "native-ask-only"])
+const DEFAULT_MODE: PluginMode = "review-all"
+
+function parseMode(value: unknown, source: string): PluginMode | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== "string" || !PLUGIN_MODES.has(value)) {
+    throw new TypeError(`${source} must be 'review-all' or 'native-ask-only'`)
+  }
+  return value as PluginMode
+}
 const USER_CONTEXT_MAX_CHARS = 4_000
 const REVIEWER_PROMPT_URL = new URL("./auto-reviewer-prompt.md", import.meta.url)
 
@@ -518,6 +535,13 @@ function serializeToolInvocation(
   }
 
   let incomplete = false
+  // oldString/newString on an edit are diff content, not a discrete argument -- they routinely
+  // contain words like "secret"/"key" as part of ordinary identifiers (e.g. a settings-name
+  // reference such as "clientSecretSettingName") without containing an actual secret value.
+  // The shape-aware redactSecrets() check below still catches genuine credential-shaped values
+  // (assignments, known token prefixes, JWTs) in these fields; only the blanket keyword-anywhere
+  // check is skipped, and only for these two fields on this one tool.
+  const isEditDiffField = (key: string) => tool === "edit" && (key === "oldString" || key === "newString")
   const redact = (value: unknown, key = "", depth = 0): unknown => {
     if (key && SECRET_NAME.test(key)) {
       incomplete = true
@@ -534,12 +558,12 @@ function serializeToolInvocation(
         return projection.text
       }
       const redacted = redactSecrets(value)
-      if (redacted !== value || SECRET_NAME.test(value)) {
+      if (redacted !== value || (!isEditDiffField(key) && SECRET_NAME.test(value))) {
         incomplete = true
         return `[redacted ${value.length} characters; invocation must be blocked]`
       }
-      if (value.length > 500) incomplete = true
-      return truncate(redacted, 500)
+      if (value.length > 8_000) incomplete = true
+      return truncate(redacted, 8_000)
     }
     if (Array.isArray(value)) {
       if (value.length > 20) incomplete = true
@@ -1066,6 +1090,7 @@ export default (async ({ client, directory, $ }, options) => {
   if (options?.model !== undefined && typeof options.model !== "string") {
     throw new TypeError("auto-reviewer option 'model' must use the string format 'provider/model'")
   }
+  const globalMode = parseMode(options?.mode, "auto-reviewer option 'mode'")
 
   const reviewerPrompt = (await readFile(REVIEWER_PROMPT_URL, "utf8")).trim()
   if (!reviewerPrompt) throw new Error(`auto-reviewer prompt is empty: ${REVIEWER_PROMPT_URL.pathname}`)
@@ -1087,6 +1112,7 @@ export default (async ({ client, directory, $ }, options) => {
   const cache = new Map<string, { expires: number; decision: Decision }>()
   const pending = new Map<string, Promise<Decision>>()
   let fallbackModel: ModelRef | undefined
+  let currentMode: PluginMode = globalMode ?? DEFAULT_MODE
 
   async function log(level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) {
     try {
@@ -1238,27 +1264,46 @@ export default (async ({ client, directory, $ }, options) => {
     )
   }
 
-  async function handlePermissionEvent(request: PermissionRequest) {
-    if (!["bash", "external_directory"].includes(request.permission)) return
-    const command = request.metadata.command
-    if (typeof command !== "string" || !command.trim()) return
-
-    try {
-      const rawCommand = command.trim()
-      const analysis = analyzeCommand(rawCommand)
-      const staticResult = staticDecision(rawCommand, request.permission, analysis)
-      const projection = redactShellCommandProjection(rawCommand)
-      if (projection.incomplete && !staticResult) {
-        throw new Error("Auto-reviewer cannot safely review an incomplete permission request")
+  // Shared by tool.execute.before (mode "review-all") and permission.ask/handlePermissionEvent
+  // (mode "native-ask-only", and as a fallback whenever native permission independently asks
+  // in "review-all" mode too) -- the same analyze/static-decide/serialize/decide pipeline
+  // regardless of which hook triggered it, so a command gets the same verdict either way.
+  async function reviewInvocation(
+    tool: string,
+    args: Record<string, unknown>,
+    sessionID: string,
+    callID: string | undefined,
+  ): Promise<Decision> {
+    const analysis = analyzeTool(tool, args)
+    const pathInspection = await inspectToolPaths(tool, args, directory, canonicalWorkspace)
+    if (pathInspection.external) analysis.behaviors.push("external-path: canonical target is outside the project")
+    if (pathInspection.ambiguous) analysis.behaviors.push("ambiguous-path: canonical target could not be verified")
+    const staticResult = staticToolDecision(tool, args, analysis, pathInspection)
+    let effectiveCwd: string | undefined
+    if (!staticResult && tool === "bash") {
+      const workdir = typeof args.workdir === "string" && args.workdir.trim() ? args.workdir.trim() : directory
+      const requestedCwd = resolve(directory, workdir)
+      effectiveCwd = await realpath(requestedCwd).catch(() => requestedCwd)
+    }
+    const serialized = serializeToolInvocation(tool, args, directory, pathInspection, effectiveCwd)
+    if (serialized.incomplete && !staticResult) {
+      throw new Error(`Auto-reviewer cannot safely review incomplete ${tool} arguments; operation blocked`)
+    }
+    const operation = serialized.text
+    if (effectiveCwd) {
+      const local = relative(canonicalWorkspace, effectiveCwd)
+      if (local === ".." || local.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(local)) {
+        analysis.behaviors.push("external-path: effective Bash working directory is outside the project")
       }
-      const decision = await decide(
-        projection.text,
-        request.permission,
-        request.sessionID,
-        request.tool?.callID,
-        analysis,
-        staticResult,
-      )
+    }
+    return decide(operation, tool, sessionID, callID, analysis, staticResult)
+  }
+
+  async function handlePermissionEvent(request: PermissionRequest) {
+    const args =
+      request.metadata && typeof request.metadata === "object" ? (request.metadata as Record<string, unknown>) : {}
+    try {
+      const decision = await reviewInvocation(request.permission, args, request.sessionID, request.tool?.callID)
       const reply = await client.postSessionIdPermissionsPermissionId({
         path: { id: request.sessionID, permissionID: request.id },
         body: { response: decision.allowed ? "once" : "reject" },
@@ -1293,14 +1338,26 @@ export default (async ({ client, directory, $ }, options) => {
 
   return {
     config: async (config) => {
-      config.permission = removeNativePrompts(config.permission as PermissionAction | PermissionRules | undefined)
+      const projectAutoMode = (config as Record<string, unknown>)["auto-mode"]
+      const projectModeField =
+        projectAutoMode && typeof projectAutoMode === "object"
+          ? (projectAutoMode as Record<string, unknown>).mode
+          : undefined
+      currentMode = parseMode(projectModeField, "project 'auto-mode.mode'") ?? globalMode ?? DEFAULT_MODE
 
-      for (const agent of Object.values(config.agent ?? {})) {
-        if (!agent) continue
-        const permission = agent.permission
-        if (!permission) continue
-        agent.permission = removeNativePrompts(permission as PermissionAction | PermissionRules)
+      if (currentMode === "review-all") {
+        config.permission = removeNativePrompts(config.permission as PermissionAction | PermissionRules | undefined)
+
+        for (const agent of Object.values(config.agent ?? {})) {
+          if (!agent) continue
+          const permission = agent.permission
+          if (!permission) continue
+          agent.permission = removeNativePrompts(permission as PermissionAction | PermissionRules)
+        }
       }
+      // In "native-ask-only" mode, native permission config is left exactly as configured --
+      // whatever it already resolves to "allow" bypasses this plugin entirely, and whatever it
+      // resolves to "ask" is what tool.execute.before + permission.ask below actually review.
 
       fallbackModel = configuredModel ?? parseModel(config.small_model) ?? parseModel(config.model)
       const existingAgent = config.agent?.[REVIEWER_AGENT]
@@ -1333,31 +1390,28 @@ export default (async ({ client, directory, $ }, options) => {
     },
     "tool.execute.before": async (input, output) => {
       const args = output.args && typeof output.args === "object" ? (output.args as Record<string, unknown>) : {}
-      const analysis = analyzeTool(input.tool, args)
-      const pathInspection = await inspectToolPaths(input.tool, args, directory, canonicalWorkspace)
-      if (pathInspection.external) analysis.behaviors.push("external-path: canonical target is outside the project")
-      if (pathInspection.ambiguous) analysis.behaviors.push("ambiguous-path: canonical target could not be verified")
-      const staticResult = staticToolDecision(input.tool, args, analysis, pathInspection)
-      let effectiveCwd: string | undefined
-      if (!staticResult && input.tool === "bash") {
-        const workdir = typeof args.workdir === "string" && args.workdir.trim() ? args.workdir.trim() : directory
-        const requestedCwd = resolve(directory, workdir)
-        effectiveCwd = await realpath(requestedCwd).catch(() => requestedCwd)
-      }
-      const serialized = serializeToolInvocation(input.tool, args, directory, pathInspection, effectiveCwd)
-      if (serialized.incomplete && !staticResult) {
-        throw new Error(`Auto-reviewer cannot safely review incomplete ${input.tool} arguments; operation blocked`)
-      }
-      const operation = serialized.text
-      if (effectiveCwd) {
-        const local = relative(canonicalWorkspace, effectiveCwd)
-        if (local === ".." || local.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(local)) {
-          analysis.behaviors.push("external-path: effective Bash working directory is outside the project")
+
+      if (currentMode === "native-ask-only") {
+        // Only the always-apply hard blocks hold here (e.g. dynamic shell expansion,
+        // sudo/rm -rf/mkfs-class commands) -- these should never be auto-approved regardless
+        // of how the project's own permission config is set up. Everything else is left to
+        // native permission (untouched in this mode) to decide: already-"allow" rules bypass
+        // this plugin entirely, and "ask" rules are what permission.ask below reviews.
+        const analysis = analyzeTool(input.tool, args)
+        if (analysis.hardBlockReason) {
+          await log("info", "Pre-execution hard block", {
+            tool: input.tool,
+            callID: input.callID,
+            reason: analysis.hardBlockReason,
+          })
+          throw new Error(`Auto-reviewer blocked ${input.tool}: ${analysis.hardBlockReason}`)
         }
+        return
       }
+
       let decision: Decision
       try {
-        decision = await decide(operation, input.tool, input.sessionID, input.callID, analysis, staticResult)
+        decision = await reviewInvocation(input.tool, args, input.sessionID, input.callID)
       } catch (error) {
         const failure = errorMessage(error)
         await log("error", "Pre-execution tool review failed; blocking the operation", {
@@ -1380,25 +1434,10 @@ export default (async ({ client, directory, $ }, options) => {
       }
     },
     "permission.ask": async (input, output) => {
-      if (!["bash", "external_directory"].includes(input.type)) return
-      const command = input.metadata.command
-      if (typeof command !== "string" || !command.trim()) return
+      const args =
+        input.metadata && typeof input.metadata === "object" ? (input.metadata as Record<string, unknown>) : {}
       try {
-        const rawCommand = command.trim()
-        const analysis = analyzeCommand(rawCommand)
-        const staticResult = staticDecision(rawCommand, input.type, analysis)
-        const projection = redactShellCommandProjection(rawCommand)
-        if (projection.incomplete && !staticResult) {
-          throw new Error("Auto-reviewer cannot safely review an incomplete permission request")
-        }
-        const decision = await decide(
-          projection.text,
-          input.type,
-          input.sessionID,
-          input.callID,
-          analysis,
-          staticResult,
-        )
+        const decision = await reviewInvocation(input.type, args, input.sessionID, input.callID)
         output.status = decision.allowed ? "allow" : "deny"
         await reportDecision(decision)
       } catch (error) {

@@ -37,6 +37,7 @@ async function makeHooks(
   priorCommands: string[] = [],
   assistantMessages: string[] = [],
   gitOutputs: string[] = [],
+  pluginOptions: Record<string, unknown> = {},
 ) {
   const state: MockState = { promptCalls: 0, reviewerRequests: [], permissionResponses: [] }
   const client = {
@@ -99,7 +100,7 @@ async function makeHooks(
       serverUrl: new URL("http://localhost:4096"),
       $: makeShell(gitOutputs),
     } as never,
-    { enabled: true, model: "openai/test-model" },
+    { enabled: true, model: "openai/test-model", ...pluginOptions },
   )
   return { hooks, state }
 }
@@ -170,6 +171,75 @@ describe("configuration", () => {
       buildOutput as never,
     )
     expect(buildOutput.temperature).toBe(0.7)
+  })
+})
+
+describe("mode setting", () => {
+  test("rejects an unrecognized mode option", async () => {
+    await expect(
+      makeHooks("ALLOW: authorized test operation", [], "/workspace/project", [], [], [], { mode: "bogus" }),
+    ).rejects.toThrow("must be 'review-all' or 'native-ask-only'")
+  })
+
+  test("native-ask-only mode leaves native permission config untouched", async () => {
+    const { hooks } = await makeHooks(undefined, [], "/workspace/project", [], [], [], { mode: "native-ask-only" })
+    const config = { permission: { "*": "ask" } } as never
+
+    await hooks.config?.(config)
+
+    expect((config as { permission: unknown }).permission).toEqual({ "*": "ask" })
+    const reviewer = (config as unknown as { agent: Record<string, unknown> }).agent?.["auto-reviewer"]
+    expect(reviewer).toBeTruthy()
+  })
+
+  test("project-level auto-mode.mode overrides the global option", async () => {
+    const { hooks } = await makeHooks(undefined, [], "/workspace/project", [], [], [], { mode: "review-all" })
+    const config = { permission: { "*": "ask" }, "auto-mode": { mode: "native-ask-only" } } as never
+
+    await hooks.config?.(config)
+
+    expect((config as { permission: unknown }).permission).toEqual({ "*": "ask" })
+  })
+
+  test("native-ask-only mode: tool.execute.before still hard-blocks obviously destructive commands", async () => {
+    const { hooks, state } = await makeHooks(undefined, [], "/workspace/project", [], [], [], {
+      mode: "native-ask-only",
+    })
+
+    await expect(executeBefore(hooks, "bash", { command: "sudo --version" })).rejects.toThrow(
+      "privilege escalation",
+    )
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("native-ask-only mode: tool.execute.before does not review ordinary commands itself", async () => {
+    const { hooks, state } = await makeHooks(undefined, [], "/workspace/project", [], [], [], {
+      mode: "native-ask-only",
+    })
+
+    await executeBefore(hooks, "bash", { command: "dotnet build" })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("permission.ask reviews non-bash tool types now that it is generalized", async () => {
+    const { hooks, state } = await makeHooks(undefined, [], "/workspace/project", [], [], [], {
+      mode: "native-ask-only",
+    })
+    const output = { status: "ask" }
+
+    await hooks["permission.ask"]?.(
+      {
+        type: "edit",
+        sessionID: "session",
+        callID: "call",
+        metadata: { filePath: "src/app.ts", oldString: "const x = 1", newString: "const x = 2" },
+      } as never,
+      output as never,
+    )
+
+    expect(state.promptCalls).toBe(1)
+    expect(output.status).toBe("allow")
   })
 })
 
@@ -862,6 +932,57 @@ describe("pre-execution review", () => {
     await expect(executeBefore(hooks, "custom_remote_tool", { [key]: value })).rejects.toThrow(
       "cannot safely review incomplete custom_remote_tool arguments",
     )
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("does not treat a setting-name reference in edit diff content as a secret", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "edit", {
+      filePath: "apps/frontend/public/staticwebapp.config.json",
+      oldString: `"clientSecretSettingName": "AAD_CLIENT_SECRET"`,
+      newString: `"clientSecretSettingName": "AAD_CLIENT_SECRET_V2"`,
+    })
+
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("does not hard-block a large but ordinary edit diff", async () => {
+    const { hooks, state } = await makeHooks()
+    const newString = "const routes = [\n" + "  { path: '/x', allowed: true },\n".repeat(150) + "]"
+
+    await executeBefore(hooks, "edit", {
+      filePath: "apps/frontend/src/routes.ts",
+      oldString: "const routes = []",
+      newString,
+    })
+
+    expect(newString.length).toBeGreaterThan(500)
+    expect(state.promptCalls).toBe(1)
+  })
+
+  test("still blocks a genuine secret-shaped value inside edit diff content", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await expect(
+      executeBefore(hooks, "edit", {
+        filePath: "apps/api/local.settings.json",
+        oldString: `"OPENAI_API_KEY": ""`,
+        newString: `"OPENAI_API_KEY": "sk-abcdef1234567890abcdef1234567890abcdef12"`,
+      }),
+    ).rejects.toThrow("cannot safely review incomplete edit arguments")
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("still scrutinizes edit filePath, not just diff content, for secret-looking values", async () => {
+    const marker = "SYNTHETIC_SAFE_KEY_SECRET_123456789"
+    const { hooks, state } = await makeHooks()
+
+    await expect(
+      executeBefore(hooks, "edit", { filePath: marker, oldString: "a", newString: "b" }),
+    ).rejects.toThrow("cannot safely review incomplete edit arguments")
 
     expect(state.promptCalls).toBe(0)
   })
