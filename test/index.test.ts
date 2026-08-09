@@ -243,6 +243,82 @@ describe("mode setting", () => {
   })
 })
 
+describe("allowExternalPaths setting", () => {
+  const nonStaticCommand = 'for p in ~/.dotnet ~/.local/bin; do [ -d "$p" ] && echo "$p"; done'
+
+  test("rejects a non-boolean allowExternalPaths option", async () => {
+    await expect(
+      makeHooks("ALLOW: authorized test operation", [], "/workspace/project", [], [], [], {
+        allowExternalPaths: "yes",
+      }),
+    ).rejects.toThrow("must be a boolean")
+  })
+
+  test("defaults to false: no project-authorization block is sent to the reviewer", async () => {
+    const { hooks, state } = await makeHooks("ALLOW: ordinary diagnostic command")
+
+    await executeBefore(hooks, "bash", { command: nonStaticCommand })
+
+    expect(state.reviewerRequests[0]).not.toContain("allowExternalPaths: true")
+  })
+
+  test("global option: adds a standing project-authorization block to the reviewer prompt", async () => {
+    const { hooks, state } = await makeHooks("ALLOW: ordinary diagnostic command", [], "/workspace/project", [], [], [], {
+      allowExternalPaths: true,
+    })
+
+    await executeBefore(hooks, "bash", { command: nonStaticCommand })
+
+    expect(state.reviewerRequests[0]).toContain("allowExternalPaths: true")
+    expect(state.reviewerRequests[0]).toContain("<authorization_context")
+  })
+
+  test("project-level auto-mode.allowExternalPaths overrides the global option", async () => {
+    const { hooks, state } = await makeHooks("ALLOW: ordinary diagnostic command", [], "/workspace/project", [], [], [], {
+      allowExternalPaths: false,
+    })
+    await hooks.config?.({ "auto-mode": { allowExternalPaths: true } } as never)
+
+    await executeBefore(hooks, "bash", { command: nonStaticCommand })
+
+    expect(state.reviewerRequests[0]).toContain("allowExternalPaths: true")
+  })
+
+  test("rejects a non-boolean project-level auto-mode.allowExternalPaths", async () => {
+    const { hooks } = await makeHooks("ALLOW: authorized test operation")
+
+    await expect(hooks.config?.({ "auto-mode": { allowExternalPaths: "yes" } } as never)).rejects.toThrow(
+      "must be a boolean",
+    )
+  })
+})
+
+describe("block retry hint", () => {
+  test("an LLM BLOCK verdict is told it can ask the user and retry", async () => {
+    const { hooks } = await makeHooks("BLOCK: no current external authorization")
+
+    await expect(executeBefore(hooks, "bash", { command: "dotnet build" })).rejects.toThrow(
+      "ask the user to explicitly authorize it, then retry",
+    )
+  })
+
+  test("a hard (static) block is not told to retry -- it's unconditional regardless of authorization", async () => {
+    const { hooks, state } = await makeHooks("ALLOW: reviewer must not be reached")
+
+    let message = ""
+    try {
+      await executeBefore(hooks, "bash", { command: "sudo --version" })
+      throw new Error("expected executeBefore to reject")
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+
+    expect(message).toContain("privilege escalation")
+    expect(message).not.toContain("ask the user to explicitly authorize it, then retry")
+    expect(state.promptCalls).toBe(0)
+  })
+})
+
 describe("pre-execution review", () => {
   test("statically permits a single safe command", async () => {
     const { hooks, state } = await makeHooks()
@@ -1381,6 +1457,17 @@ describe("pre-execution review", () => {
       } finally {
         await rm(base, { recursive: true, force: true })
       }
+    },
+  )
+
+  test.each(["echo $HOME", 'for p in ~/.dotnet ~/.local/bin; do [ -d "$p" ] && echo "$p"; done', 'echo "${PATH}"'])(
+    "does not hard-block bare variable expansion (no substitution or grouping): %s",
+    async (command) => {
+      const { hooks, state } = await makeHooks("ALLOW: ordinary diagnostic command")
+
+      await executeBefore(hooks, "bash", { command })
+
+      expect(state.promptCalls).toBe(1)
     },
   )
 

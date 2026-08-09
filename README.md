@@ -136,6 +136,7 @@ The plugin accepts these options in the second element of the plugin tuple:
 | `model` | string | Context-dependent | Reviewer model in `provider/model` format. |
 | `timeoutMs` | number | `60000` | LLM review timeout. Values are clamped between 1,000 and 300,000 milliseconds. |
 | `mode` | `"review-all"` \| `"native-ask-only"` | `"review-all"` | See [Review Mode](#review-mode). |
+| `allowExternalPaths` | boolean | `false` | See [Allow External Paths](#allow-external-paths). |
 
 ### Review Mode
 
@@ -161,6 +162,28 @@ Override it per project by adding a top-level `auto-mode` block to that project'
 ```
 
 The project-level override always wins over the global plugin option.
+
+### Allow External Paths
+
+By default, the reviewer requires *some* authorization from the current conversation before allowing a tool call to reach outside the project directory -- either an exact path/project the user named, or a general statement granting permission. This is deliberately strict, but it means ordinary, non-destructive environment discovery (checking whether a tool or SDK is installed in a standard location, listing `~/.local/bin`, etc.) gets blocked unless the user happened to say something like "you can access outside the project" earlier in the conversation.
+
+Setting `allowExternalPaths: true` grants a standing, project-level version of that same authorization, so it doesn't need to be repeated every conversation. It only satisfies the external-path rule -- it does not relax any other rule (secrets, destructive operations, privilege escalation, etc. are unaffected).
+
+```json
+{
+  "enabled": true,
+  "model": "provider/model-id",
+  "allowExternalPaths": true
+}
+```
+
+Or per project:
+
+```json
+{
+  "auto-mode": { "allowExternalPaths": true }
+}
+```
 
 ### Enable or Disable
 
