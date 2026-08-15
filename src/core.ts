@@ -665,7 +665,11 @@ export async function getConversationContext(
   )
   if (result.error) throw new Error(`Could not read conversation context: ${errorMessage(result.error)}`)
 
-  const messages = (result.data ?? []) as MessageWithParts[]
+  return projectConversation((result.data ?? []) as MessageWithParts[], currentCallID)
+}
+
+/** Pure projection of a message history into reviewer context. */
+export function projectConversation(messages: MessageWithParts[], currentCallID?: string): ConversationContext {
   const userMessages = messages.filter((message) => message.info.role === "user")
   const assistantMessages = messages.filter((message) => message.info.role === "assistant")
   const userText = userMessages.map(extractText).filter((text): text is string => Boolean(text))

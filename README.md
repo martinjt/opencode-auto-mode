@@ -23,7 +23,7 @@ For operations that require LLM classification, the plugin is fail-closed. If no
 
 ## Requirements
 
-- OpenCode 1.18.4 or newer.
+- OpenCode 1.18.4 or newer for the v1 entry; OpenCode v2 with `@opencode-ai/plugin` 1.18.18 or newer for the v2 entry.
 - At least one configured OpenCode model if commands can reach the LLM-review tier.
 - Node.js-compatible filesystem APIs. OpenCode normally runs the plugin with Bun.
 
@@ -42,6 +42,49 @@ The `tool.execute.before` hook performs the review before any tool executes. Nat
 Only selected low-risk local operations are statically allowed. A well-formed `apply_patch` bypasses model review when all canonical target paths stay inside the project. Other filesystem tools such as `read`, `glob`, and `grep`, external paths, `.env` files, unknown tools, and remote operations are sent to the reviewer with bounded context.
 
 The recommended base configuration keeps `"permission": {"*": "ask"}` outside the plugin tuple. The plugin converts that fallback to automatic pre-execution review when it loads. If the plugin is disabled or fails to load, OpenCode retains native permission prompts instead of silently allowing tools.
+
+## OpenCode v2
+
+OpenCode v2 does not run v1 plugins, and its plugin context exposes no tool-execution or permission hook, so `tool.execute.before` has no v2 equivalent — legacy hook names register successfully and are then never called. The package therefore ships a second entrypoint, `opencode-auto-mode/v2` (`src/v2/index.ts`), which reaches the same three tiers through the hooks v2 does expose.
+
+### How the v2 entry works
+
+The decision point moves to the language-model boundary. `ctx.aisdk.language` wraps the model serving the session; each tool call the model emits is held while the classifier runs, and the verdict is written into the agent's permission ruleset through `ctx.agent.transform` before the call is released. Because v2 resolves an agent's ruleset on every permission assertion, the rule written milliseconds earlier is the one the tool observes.
+
+| Concern | v1 | v2 |
+| --- | --- | --- |
+| Interception point | `tool.execute.before` | wrapped `LanguageModelV3` |
+| Enforcement | throw from the hook | `allow` / `deny` rule recorded before the call runs |
+| Blocked-call reason | thrown error text | rewritten into the tool result on the next request |
+| Reviewer | hidden `auto-reviewer` subagent | direct model call (session model by default) |
+| Reviewer context | rebuilt from the session API | read from the request the model was about to receive |
+
+Two consequences worth knowing:
+
+- **Reasons take one turn to surface.** v2 flattens every permission failure into a generic per-tool message (`Unable to execute command: …`), discarding both the block reason and the fact that it was a permission decision. The plugin records the reason and rewrites that tool result on the next request, so the model reads `Blocked by auto mode: <reason>` where it would otherwise read the generic string.
+- **Some calls cannot be targeted.** A rule needs an action and an exact resource. Tools outside the built-in set (MCP tools, for example), operations whose resource contains `*` or `?`, and calls nested inside a single `execute` invocation are left to the configuration already in place rather than being silently allowed.
+
+### Install on v2
+
+v2 resolves a bare package name to the package's main entrypoint, which is the v1 plugin, so the v2 entry is referenced by path. Either point at it directly in `opencode.json`:
+
+```json
+{
+  "plugins": [
+    { "package": "file:///absolute/path/to/opencode-auto-mode/src/v2/index.ts", "options": { "enabled": true } }
+  ]
+}
+```
+
+or re-export it from a project-local plugin file, `.opencode/plugin/auto-mode.ts`:
+
+```ts
+export { default } from "opencode-auto-mode/v2"
+```
+
+v2 options (all optional): `enabled`, `model` (`"provider/model"`, defaults to the session model), `timeoutMs`, `cacheTtlMs`, `ruleTtlMs`, `agents` (agent ids to govern; default all), `workspace` (project root; defaults to the server's working directory), and `fallback` — `"ask"` (default) leaves unreviewed operations to your configured rules, `"deny"` installs a catch-all deny underneath them.
+
+Set `OPENCODE_AUTO_MODE_DEBUG=1` to log every decision. v2 swallows plugin load failures silently, so check the server log if nothing appears.
 
 ## Installation
 
