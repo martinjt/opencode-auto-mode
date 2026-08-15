@@ -79,7 +79,7 @@ type RedactedProjection = {
 type Decision = {
   allowed: boolean
   reason: string
-  source: "static-allow" | "static-block" | "llm"
+  source: "static-allow" | "static-block" | "llm" | "yolo"
 }
 
 type PermissionAction = "ask" | "allow" | "deny"
@@ -931,6 +931,18 @@ function defeatsAutoPermit(command: string): boolean {
   return false
 }
 
+function isTruthyEnv(value: string | undefined): boolean {
+  if (typeof value !== "string") return false
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase())
+}
+
+// Yolo mode skips every LLM review, but never the hard block list: those cover
+// operations that damage the machine rather than the project.
+function yoloDecision(staticResult: Decision | null): Decision {
+  if (staticResult && !staticResult.allowed) return staticResult
+  return staticResult ?? { allowed: true, reason: "yolo mode: review skipped", source: "yolo" }
+}
+
 function staticDecision(command: string, permission: string, analysis: Analysis): Decision | null {
   if (analysis.hardBlockReason) {
     return { allowed: false, reason: analysis.hardBlockReason, source: "static-block" }
@@ -1027,6 +1039,10 @@ export default (async ({ client, directory, $ }, options) => {
   if (options?.model !== undefined && typeof options.model !== "string") {
     throw new TypeError("auto-reviewer option 'model' must use the string format 'provider/model'")
   }
+  if (options?.yolo !== undefined && typeof options.yolo !== "boolean") {
+    throw new TypeError("auto-reviewer option 'yolo' must be a boolean")
+  }
+  const yolo = options?.yolo === true || isTruthyEnv(process.env.OPENCODE_AUTO_REVIEWER_YOLO)
 
   const reviewerPrompt = (await readFile(REVIEWER_PROMPT_URL, "utf8")).trim()
   if (!reviewerPrompt) throw new Error(`auto-reviewer prompt is empty: ${REVIEWER_PROMPT_URL.pathname}`)
@@ -1143,6 +1159,7 @@ export default (async ({ client, directory, $ }, options) => {
     analysis: Analysis = analyzeCommand(operation),
     staticResult: Decision | null = staticDecision(operation, permission, analysis),
   ): Promise<Decision> {
+    if (yolo) return yoloDecision(staticResult)
     const key = reviewCacheKey(sessionID, operation, callID)
     const now = Date.now()
     for (const [cacheKey, entry] of cache) {
@@ -1169,6 +1186,7 @@ export default (async ({ client, directory, $ }, options) => {
 
   async function reportDecision(decision: Decision) {
     if (decision.source === "static-allow") return
+    if (decision.source === "yolo") return
     await notify(
       `${decision.allowed ? "Allowed" : "Blocked"}: ${decision.reason}`,
       decision.allowed ? "success" : "warning",
@@ -1185,7 +1203,7 @@ export default (async ({ client, directory, $ }, options) => {
       const analysis = analyzeCommand(rawCommand)
       const staticResult = staticDecision(rawCommand, request.permission, analysis)
       const projection = redactShellCommandProjection(rawCommand)
-      if (projection.incomplete && !staticResult) {
+      if (projection.incomplete && !staticResult && !yolo) {
         throw new Error("Auto-reviewer cannot safely review an incomplete permission request")
       }
       const decision = await decide(
@@ -1228,6 +1246,14 @@ export default (async ({ client, directory, $ }, options) => {
     }
   }
 
+  if (yolo) {
+    void log(
+      "warn",
+      "Auto-reviewer is in yolo mode: tool calls run without LLM review; only hard-blocked system commands are refused",
+    )
+    void notify("Yolo mode: tools run without review", "warning")
+  }
+
   return {
     config: async (config) => {
       config.permission = removeNativePrompts(config.permission as PermissionAction | PermissionRules | undefined)
@@ -1258,7 +1284,11 @@ export default (async ({ client, directory, $ }, options) => {
     "tool.execute.before": async (input, output) => {
       const args = output.args && typeof output.args === "object" ? (output.args as Record<string, unknown>) : {}
       const analysis = analyzeTool(input.tool, args)
-      const pathInspection = await inspectToolPaths(input.tool, args, directory, canonicalWorkspace)
+      // Yolo mode never sends the operation to the reviewer, so the filesystem
+      // work that only builds review context is skipped.
+      const pathInspection = yolo
+        ? { external: false, ambiguous: false, targets: [] }
+        : await inspectToolPaths(input.tool, args, directory, canonicalWorkspace)
       if (pathInspection.external) analysis.behaviors.push("external-path: canonical target is outside the project")
       if (pathInspection.ambiguous) analysis.behaviors.push("ambiguous-path: canonical target could not be verified")
       const staticResult = staticToolDecision(input.tool, args, analysis, pathInspection)
@@ -1269,7 +1299,7 @@ export default (async ({ client, directory, $ }, options) => {
         effectiveCwd = await realpath(requestedCwd).catch(() => requestedCwd)
       }
       const serialized = serializeToolInvocation(input.tool, args, directory, pathInspection, effectiveCwd)
-      if (serialized.incomplete && !staticResult) {
+      if (serialized.incomplete && !staticResult && !yolo) {
         throw new Error(`Auto-reviewer cannot safely review incomplete ${input.tool} arguments; operation blocked`)
       }
       const operation = serialized.text
@@ -1312,7 +1342,7 @@ export default (async ({ client, directory, $ }, options) => {
         const analysis = analyzeCommand(rawCommand)
         const staticResult = staticDecision(rawCommand, input.type, analysis)
         const projection = redactShellCommandProjection(rawCommand)
-        if (projection.incomplete && !staticResult) {
+        if (projection.incomplete && !staticResult && !yolo) {
           throw new Error("Auto-reviewer cannot safely review an incomplete permission request")
         }
         const decision = await decide(

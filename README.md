@@ -20,6 +20,7 @@ For operations that require LLM classification, the plugin is fail-closed. If no
 - Reviews external filesystem access, source mutations, network operations, and remote-service tools with the configured model.
 - Applies task-scoped policy to secrets, data transmission, downloaded code, destructive changes, persistence, network exposure, remote mutations, and subagent delegation.
 - Caches decisions for the same tool call.
+- Offers an opt-in yolo mode that skips LLM review entirely while keeping the system-destructive hard blocks.
 
 ## Requirements
 
@@ -135,6 +136,34 @@ The plugin accepts these options in the second element of the plugin tuple:
 | `enabled` | boolean | `true` | Enables or disables every plugin hook and configuration change. |
 | `model` | string | Context-dependent | Reviewer model in `provider/model` format. |
 | `timeoutMs` | number | `60000` | LLM review timeout. Values are clamped between 1,000 and 300,000 milliseconds. |
+| `yolo` | boolean | `false` | Skips LLM review entirely and allows every operation except the static hard blocks. |
+
+### Yolo Mode
+
+```json
+{
+  "enabled": true,
+  "yolo": true
+}
+```
+
+Yolo mode is for sessions where review latency costs more than it protects. With `yolo` enabled:
+
+- No operation is sent to the reviewer model, so no tool call waits on an LLM round trip, and no reviewer model needs to be configured or reachable.
+- Native permission prompts stay disabled, so nothing asks for approval.
+- The static hard blocks still apply. `sudo`, `rm -rf /`, `chmod 777`, `mkfs`, `dd if=`, fork bombs, and shutdown or reboot commands are still refused.
+- Fail-closed serialization checks no longer block. Operations whose arguments cannot be safely redacted for review — the reviewer never sees them — run instead of being refused.
+- Per-operation toasts are suppressed. One warning toast and one warning log line are emitted at startup so the mode is visible.
+
+Everything else runs unchanged: external file access, network calls, installs, force-push, recursive deletion inside the project, and remote-service tools all execute without review. Treat a yolo session as equivalent to running the commands yourself, in a directory you are willing to lose.
+
+`OPENCODE_AUTO_REVIEWER_YOLO` set to `1`, `true`, `yes`, or `on` enables the same mode without editing the configuration, which suits a one-off shell:
+
+```bash
+OPENCODE_AUTO_REVIEWER_YOLO=1 opencode
+```
+
+Either source enables yolo mode; the tuple option does not need to be set for the environment variable to take effect.
 
 ### Enable or Disable
 
@@ -235,6 +264,8 @@ The following conditions block tool invocations that need LLM review:
 - Tool arguments exceed the serializer's array, object, nesting, or total-size limits.
 
 The plugin logs the failure, shows an OpenCode error toast when a TUI is attached, and throws before tool execution. It never falls back to an unreviewed automatic allow.
+
+None of this applies in yolo mode, which removes the LLM-review tier altogether. Only the static hard blocks remain.
 
 ## Context Sent to the Reviewer
 
