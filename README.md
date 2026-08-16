@@ -103,6 +103,7 @@ Note that `model` only takes effect once that model has been resolved for some s
 
 - Plugins load per location, and the server caches the plugin module by the **entrypoint's** mtime only — modules the entrypoint imports stay cached at their first-loaded version. After editing any file other than `src/v2/index.ts`, restart the background server (`opencode2 service stop && opencode2 service start`) rather than relying on a `touch`, or the old module is silently reused.
 - Restarting the background server re-inherits the environment of whatever restarts it. If the server was started with provider credentials or `OPENCODE_CONFIG` in its environment, restart it the same way or it will come back without them.
+- Registering a domain transform that mutates its domain schedules a rebuild that is batched behind plugin boot, so the plugin registers transforms without awaiting them. Awaiting one inside `setup` hangs the load with no error in the log — the plugin simply never finishes loading.
 - v2 swallows plugin load failures; check the server log (`~/.local/share/opencode/log/opencode.log`) for `failed to load plugin` if nothing seems to happen. Set `OPENCODE_AUTO_MODE_DEBUG=1` to log every decision.
 
 ## Installation

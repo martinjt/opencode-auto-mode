@@ -104,11 +104,25 @@ export const plugin = {
 
     const governed = new Set(stringListOption(options, "agents"))
 
+    /**
+     * Registering a transform that mutates its domain schedules a rebuild, and
+     * during plugin boot that rebuild is batched behind setup itself: awaiting
+     * the registration deadlocks the load. Register it and let it settle on its
+     * own — the plugin has nothing to do with the result.
+     */
+    const register = (registration: Promise<unknown>) => {
+      void registration.catch((error) => {
+        log("error", "auto mode could not register a domain transform", { error: errorMessage(error) })
+      })
+    }
+
     if (hasToolHook(ctx)) {
       if (boolOption(options, "suppressPrompts", true)) {
-        await ctx.agent.transform((draft) => {
-          suppressNativePrompts(draft, governed)
-        })
+        register(
+          ctx.agent.transform((draft) => {
+            suppressNativePrompts(draft, governed)
+          }),
+        )
       }
       if (reviewerModel) await captureReviewer()
       await installToolHook(ctx, {
@@ -139,9 +153,11 @@ export const plugin = {
       base: basePosture(typeof options.fallback === "string" ? options.fallback : "ask"),
       agents: governed,
     })
-    await ctx.agent.transform((draft) => {
-      rules.apply(draft)
-    })
+    register(
+      ctx.agent.transform((draft) => {
+        rules.apply(draft)
+      }),
+    )
 
     const gate = makeGate({
       workspace,
