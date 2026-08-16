@@ -6,6 +6,8 @@ import type { PluginContextLike, SessionDomain, ToolDomain } from "./api.ts"
 import { parseDecision } from "../core.ts"
 
 export type ToolHookDeps = Omit<ClassifierDeps, "review" | "context"> & {
+  /** The reviewer's standing instructions, prepended to every review turn. */
+  reviewerPrompt: string
   /** Reviewer turn. Falls back to the session's own model via `session.generate`. */
   review?: (request: string, sessionID: string) => Promise<{ allowed: boolean; reason: string }>
   log: GateLog
@@ -78,20 +80,44 @@ export async function installToolHook(
     projectDoc: null,
   })
 
+  /**
+   * Reviews run in their own session where the build allows one, so the
+   * reviewer's instructions are not competing with the working session's system
+   * prompt and history. The live session is the fallback.
+   */
+  let reviewSession: Promise<string | undefined> | undefined
+  const reviewerSessionID = (fallback: string) => {
+    if (typeof session?.create !== "function") return Promise.resolve(fallback)
+    reviewSession ??= Promise.resolve(session.create({ title: "auto mode review" }))
+      .then((created: any) => (typeof created?.id === "string" ? created.id : undefined))
+      .catch((error) => {
+        deps.log("warn", "auto mode could not open a review session; reviewing in the working session", {
+          error: errorMessage(error),
+        })
+        return undefined
+      })
+    return reviewSession.then((id) => id ?? fallback)
+  }
+
   const review = async (request: string, sessionID: string) => {
     if (deps.review) return deps.review(request, sessionID)
     if (typeof session?.generate !== "function") {
       throw new Error("no reviewer available: this build exposes no session.generate and no reviewer model is set")
     }
-    // session.generate answers with the session's own model, which sometimes
-    // returns nothing or prose instead of the one-line verdict. Ask once more
-    // before failing closed; a second unclear answer still blocks.
-    const attempt = async (prompt: string) => parseDecision((await session.generate!({ sessionID, prompt })).text ?? "")
+    const target = await reviewerSessionID(sessionID)
+    // generate() takes a single prompt, so the reviewer's standing instructions
+    // travel with every request. Without them the model answers conversationally
+    // instead of with a verdict.
+    const attempt = async (suffix: string) =>
+      parseDecision(
+        (await session.generate!({ sessionID: target, prompt: `${deps.reviewerPrompt}\n\n${request}${suffix}` })).text ??
+          "",
+      )
     try {
-      return await attempt(request)
+      return await attempt("")
     } catch (error) {
       deps.log("warn", "auto mode reviewer response was unclear; retrying once", { error: errorMessage(error) })
-      return attempt(`${request}\n\nRespond with one line only, in exactly this form: ALLOW: <reason> or BLOCK: <reason>.`)
+      return attempt("\n\nRespond with one line only, in exactly this form: ALLOW: <reason> or BLOCK: <reason>.")
     }
   }
 

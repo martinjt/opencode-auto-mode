@@ -134,6 +134,7 @@ export const plugin = {
         workspace,
         canonicalWorkspace,
         cacheTtlMs,
+        reviewerPrompt,
         log,
         ...(reviewerModel
           ? {

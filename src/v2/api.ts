@@ -34,6 +34,7 @@ export type ToolDomain = {
 }
 
 export type SessionDomain = {
+  readonly create?: (input: { title?: string }) => Promise<{ id?: string }>
   readonly generate?: (input: { sessionID: string; prompt: string }) => Promise<{ text: string }>
   readonly hook?: (name: string, callback: (event: any) => Promise<void> | void) => Promise<Registration>
 }

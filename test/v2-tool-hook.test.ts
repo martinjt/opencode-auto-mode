@@ -7,6 +7,8 @@ import { hasToolHook, registerAISDKHook } from "../src/v2/api.ts"
 import { installToolHook, projectSessionMessages } from "../src/v2/tool-hook.ts"
 import { suppressNativePrompts } from "../src/v2/rules.ts"
 
+const REVIEWER_PROMPT = "You review tool invocations. Answer ALLOW: or BLOCK:."
+
 type Hook = (event: any) => Promise<void> | void
 
 function makeContext(options: { generate?: (input: { sessionID: string; prompt: string }) => Promise<{ text: string }> } = {}) {
@@ -52,6 +54,7 @@ async function install(reviewerText: string) {
     workspace: directory,
     canonicalWorkspace: canonical,
     cacheTtlMs: 60_000,
+    reviewerPrompt: REVIEWER_PROMPT,
     log: (level, message) => logs.push({ level, message }),
   })
   const before = hooks.get("execute.before")!
@@ -124,6 +127,12 @@ describe("execute.before gating", () => {
     await expect(before(call("bash", { command: "sudo rm -rf /tmp/x" }))).rejects.toThrow(
       /Auto mode blocked bash: privilege escalation/,
     )
+  })
+
+  test("sends the reviewer its standing instructions", async () => {
+    const { before, prompts } = await install("ALLOW: fine")
+    await before(call("bash", { command: "npm run build" }))
+    expect(prompts[0]).toContain(REVIEWER_PROMPT)
   })
 
   test("throws with the reviewer's reason when the model blocks", async () => {
@@ -208,6 +217,7 @@ describe("v2 tool vocabulary", () => {
       workspace: directory,
       canonicalWorkspace: canonical,
       cacheTtlMs: 0,
+      reviewerPrompt: REVIEWER_PROMPT,
       log: () => {},
     })
     await expect(hooks.get("execute.before")!(call("shell", { command: "npm publish" }))).rejects.toThrow(
@@ -260,5 +270,81 @@ describe("native prompt suppression", () => {
     suppressNativePrompts(draft, new Set(["build"]))
     expect(items.get("build")!.permissions[0].effect).toBe("allow")
     expect(items.get("plan")!.permissions[0].effect).toBe("ask")
+  })
+})
+
+describe("review session isolation", () => {
+  test("reviews in a session of its own when the build can create one", async () => {
+    const { directory, canonical } = await workspace()
+    const created: string[] = []
+    const targets: string[] = []
+    const hooks = new Map<string, Hook>()
+    const ctx = {
+      options: {},
+      agent: { transform: async () => ({ dispose: async () => {} }), reload: async () => {} },
+      tool: {
+        hook: async (name: string, callback: Hook) => {
+          hooks.set(name, callback)
+          return { dispose: async () => {} }
+        },
+      },
+      session: {
+        create: async ({ title }: { title?: string }) => {
+          created.push(title ?? "")
+          return { id: "ses_review" }
+        },
+        generate: async ({ sessionID }: { sessionID: string }) => {
+          targets.push(sessionID)
+          return { text: "ALLOW: fine" }
+        },
+      },
+    }
+    await installToolHook(ctx as any, {
+      workspace: directory,
+      canonicalWorkspace: canonical,
+      cacheTtlMs: 0,
+      reviewerPrompt: REVIEWER_PROMPT,
+      log: () => {},
+    })
+    const before = hooks.get("execute.before")!
+    await before(call("shell", { command: "npm run build" }, "c1"))
+    await before(call("shell", { command: "npm run lint" }, "c2"))
+
+    expect(created).toHaveLength(1)
+    expect(targets).toEqual(["ses_review", "ses_review"])
+  })
+
+  test("falls back to the working session when creation fails", async () => {
+    const { directory, canonical } = await workspace()
+    const targets: string[] = []
+    const hooks = new Map<string, Hook>()
+    const ctx = {
+      options: {},
+      agent: { transform: async () => ({ dispose: async () => {} }), reload: async () => {} },
+      tool: {
+        hook: async (name: string, callback: Hook) => {
+          hooks.set(name, callback)
+          return { dispose: async () => {} }
+        },
+      },
+      session: {
+        create: async () => {
+          throw new Error("no sessions here")
+        },
+        generate: async ({ sessionID }: { sessionID: string }) => {
+          targets.push(sessionID)
+          return { text: "ALLOW: fine" }
+        },
+      },
+    }
+    await installToolHook(ctx as any, {
+      workspace: directory,
+      canonicalWorkspace: canonical,
+      cacheTtlMs: 0,
+      reviewerPrompt: REVIEWER_PROMPT,
+      log: () => {},
+    })
+    await hooks.get("execute.before")!(call("shell", { command: "npm run build" }))
+    expect(targets).toEqual(["ses_1"])
   })
 })
