@@ -59,7 +59,24 @@ ctx.tool.hook("execute.before", async (event) => { /* classify; throw to block *
 
 The classifier runs before the tool starts and blocks by throwing, so the reason lands in the tool error the model reads — exactly as in v1. Reviewer context comes from `ctx.session.hook("context")`, which carries the request's full message list, and the reviewer turn runs through `ctx.session.generate` (the session's own model) unless a `model` is configured.
 
-As in v1, the plugin also rewrites resolved `ask` rules to `allow` through `ctx.agent.transform` so its review, rather than a prompt, decides each call; explicit `deny` rules stay authoritative. Set `"suppressPrompts": false` to keep OpenCode's own prompts alongside the review.
+### Base posture: config allows, the plugin gates
+
+v1 disabled native prompts itself by rewriting resolved `ask` rules to `allow` at load time. That is not available on v2: on the builds tested here the prompt is not gated by the agent ruleset — rewriting every agent's `ask` rules to `allow` leaves the prompt firing anyway — and the plugin context exposes no policy domain. (`suppressPrompts: true` still performs the rewrite for builds where agent rules do decide; it is off by default because it is inert on the builds tested.)
+
+So on v2 the roles are inverted: **the config sets the base posture and the plugin is the gate.**
+
+```json
+{
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "allow" },
+    { "action": "shell", "resource": "sudo *", "effect": "deny" }
+  ]
+}
+```
+
+The plugin blocks before the tool asserts its permission, so everything it refuses never runs; anything it approves proceeds without a prompt.
+
+The trade-off is worth stating plainly. v1 was fail-closed — if the plugin failed to load, prompts came back. This arrangement is fail-open: an allow-all config with no plugin behaves like `--auto`. Keep explicit `deny` rules in the config for the operations you never want attempted, as above; those are evaluated independently of the plugin and still hold if it fails to load.
 
 ### Path 2 — the language-model boundary (fallback)
 
@@ -85,6 +102,10 @@ v2 resolves a bare package name to the package's main entrypoint, which is the v
       "package": "/absolute/path/to/opencode-auto-mode/src/v2/index.ts",
       "options": { "enabled": true }
     }
+  ],
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "allow" },
+    { "action": "shell", "resource": "sudo *", "effect": "deny" }
   ]
 }
 ```
@@ -95,7 +116,7 @@ or re-export it from a project-local plugin file, `.opencode/plugin/auto-mode.ts
 export { default } from "opencode-auto-mode/v2"
 ```
 
-Options (all optional): `enabled`, `suppressPrompts` (path 1; default true), `model` (`"provider/model"`), `timeoutMs`, `cacheTtlMs`, `workspace` (project root; defaults to the server's working directory), plus `ruleTtlMs`, `agents` and `fallback` which apply to path 2 only. `fallback: "ask"` (default) leaves unreviewed operations to your configured rules; `"deny"` installs a catch-all deny underneath them.
+Options (all optional): `enabled`, `suppressPrompts` (path 1; default false — see base posture above), `model` (`"provider/model"`), `timeoutMs`, `cacheTtlMs`, `workspace` (project root; defaults to the server's working directory), plus `ruleTtlMs`, `agents` and `fallback` which apply to path 2 only. `fallback: "ask"` (default) leaves unreviewed operations to your configured rules; `"deny"` installs a catch-all deny underneath them.
 
 Note that `model` only takes effect once that model has been resolved for some session, because the reviewer model is captured through the AI SDK hook. Leave it unset to review with the session's own model.
 

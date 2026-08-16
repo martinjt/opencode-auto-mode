@@ -117,7 +117,12 @@ export const plugin = {
     }
 
     if (hasToolHook(ctx)) {
-      if (boolOption(options, "suppressPrompts", true)) {
+      // Off by default: on the builds tested, the permission prompt is not
+      // gated by the agent ruleset, so this rewrite is inert there — and a
+      // blanket ask→allow is too security-relevant to apply on spec. Set the
+      // base posture in config instead (see the README) and leave this for
+      // builds where agent rules do decide.
+      if (boolOption(options, "suppressPrompts", false)) {
         register(
           ctx.agent.transform((draft) => {
             suppressNativePrompts(draft, governed)
