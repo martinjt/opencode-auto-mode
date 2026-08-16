@@ -173,3 +173,45 @@ describe("execute.before gating", () => {
     expect(prompts).toHaveLength(1)
   })
 })
+
+describe("v2 tool vocabulary", () => {
+  test("statically allows a read-only command issued through the renamed shell tool", async () => {
+    const { before, prompts } = await install("BLOCK: should not be consulted")
+    await before(call("shell", { command: "git status" }))
+    expect(prompts).toHaveLength(0)
+  })
+
+  test("statically blocks a hard-blocked command through the shell tool", async () => {
+    const { before } = await install("ALLOW: should not be consulted")
+    await expect(before(call("shell", { command: "sudo rm -rf /tmp/x" }))).rejects.toThrow(
+      /Auto mode blocked shell: privilege escalation/,
+    )
+  })
+
+  test("retries once when the reviewer answers unclearly", async () => {
+    const { directory, canonical } = await workspace()
+    const replies = ["not a verdict", "BLOCK: unrelated to the task"]
+    const hooks = new Map<string, Hook>()
+    const ctx = {
+      options: {},
+      agent: { transform: async () => ({ dispose: async () => {} }), reload: async () => {} },
+      tool: {
+        hook: async (name: string, callback: Hook) => {
+          hooks.set(name, callback)
+          return { dispose: async () => {} }
+        },
+      },
+      session: { generate: async () => ({ text: replies.shift() ?? "" }) },
+    }
+    await installToolHook(ctx as any, {
+      workspace: directory,
+      canonicalWorkspace: canonical,
+      cacheTtlMs: 0,
+      log: () => {},
+    })
+    await expect(hooks.get("execute.before")!(call("shell", { command: "npm publish" }))).rejects.toThrow(
+      /unrelated to the task/,
+    )
+    expect(replies).toHaveLength(0)
+  })
+})

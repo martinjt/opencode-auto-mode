@@ -18,6 +18,8 @@ const GLOB = /[*?]/
 const TOOL_ACTIONS: Record<string, string> = {
   apply_patch: "edit",
   bash: "bash",
+  patch: "edit",
+  shell: "shell",
   edit: "edit",
   glob: "glob",
   grep: "grep",
@@ -75,12 +77,12 @@ export function permissionTarget(
   const action = TOOL_ACTIONS[tool]
   if (!action) return undefined
 
-  if (tool === "bash") {
+  if (tool === "bash" || tool === "shell") {
     const command = stringArg(args, "command")
     return command ? { action, resources: [command] } : undefined
   }
 
-  if (tool === "apply_patch") {
+  if (tool === "apply_patch" || tool === "patch") {
     const patchText = typeof args.patchText === "string" ? args.patchText : ""
     const { paths, incomplete } = extractPatchPaths(patchText)
     if (incomplete || paths.length === 0) return undefined

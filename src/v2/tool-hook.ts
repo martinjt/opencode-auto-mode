@@ -83,8 +83,16 @@ export async function installToolHook(
     if (typeof session?.generate !== "function") {
       throw new Error("no reviewer available: this build exposes no session.generate and no reviewer model is set")
     }
-    const result = await session.generate({ sessionID, prompt: request })
-    return parseDecision(result?.text ?? "")
+    // session.generate answers with the session's own model, which sometimes
+    // returns nothing or prose instead of the one-line verdict. Ask once more
+    // before failing closed; a second unclear answer still blocks.
+    const attempt = async (prompt: string) => parseDecision((await session.generate!({ sessionID, prompt })).text ?? "")
+    try {
+      return await attempt(request)
+    } catch (error) {
+      deps.log("warn", "auto mode reviewer response was unclear; retrying once", { error: errorMessage(error) })
+      return attempt(`${request}\n\nRespond with one line only, in exactly this form: ALLOW: <reason> or BLOCK: <reason>.`)
+    }
   }
 
   const classifier = makeClassifier({

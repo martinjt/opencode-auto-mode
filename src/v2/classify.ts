@@ -33,6 +33,22 @@ export type Classifier = {
 }
 
 /**
+ * v2 renamed several built-in tools. The classifier's static tiers key off the
+ * v1 names — `analyzeCommand` only runs for `bash` — so a v2 `shell` call would
+ * otherwise skip both the hard-block list and the conservative allow list and
+ * go straight to the reviewer.
+ */
+const TOOL_ALIASES: Record<string, string> = {
+  shell: "bash",
+  subagent: "task",
+  patch: "apply_patch",
+}
+
+export function canonicalToolName(tool: string): string {
+  return TOOL_ALIASES[tool] ?? tool
+}
+
+/**
  * The three tiers, unchanged from the v1 plugin: a conservative static allow, a
  * static block for hard-blocked behaviour, and an LLM review for everything
  * else. Only the transport around it differs between OpenCode versions.
@@ -42,7 +58,10 @@ export function makeClassifier(deps: ClassifierDeps): Classifier {
   const inflight = new Map<string, Promise<Decision>>()
 
   return {
-    async classify(tool, args, scope) {
+    async classify(reported, args, scope) {
+      // Static tiers reason about the v1 tool vocabulary; messages keep the name
+      // the build actually used.
+      const tool = canonicalToolName(reported)
       const analysis = analyzeTool(tool, args)
       const pathInspection = await inspectToolPaths(tool, args, deps.workspace, deps.canonicalWorkspace)
       if (pathInspection.external) analysis.behaviors.push("external-path: canonical target is outside the project")
@@ -58,7 +77,7 @@ export function makeClassifier(deps: ClassifierDeps): Classifier {
 
       const serialized = serializeToolInvocation(tool, args, deps.workspace, pathInspection, effectiveCwd)
       if (serialized.incomplete && !staticResult) {
-        throw new Error(`auto mode cannot safely review incomplete ${tool} arguments`)
+        throw new Error(`auto mode cannot safely review incomplete ${reported} arguments`)
       }
       if (effectiveCwd) {
         const local = relative(deps.canonicalWorkspace, effectiveCwd)
@@ -77,7 +96,7 @@ export function makeClassifier(deps: ClassifierDeps): Classifier {
 
       const review = (async (): Promise<Decision> => {
         const context = await deps.context(scope)
-        const request = buildReviewRequest(serialized.text, tool, deps.workspace, context, analysis)
+        const request = buildReviewRequest(serialized.text, reported, deps.workspace, context, analysis)
         const outcome = await deps.review(request, scope)
         return { allowed: outcome.allowed, reason: outcome.reason, source: "llm" }
       })()
