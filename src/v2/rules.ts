@@ -102,6 +102,25 @@ export function grantableResources(target: PermissionTarget): string[] {
   return [...new Set(target.resources)].filter((resource) => resource.length > 0 && !GLOB.test(resource))
 }
 
+/**
+ * The v1 plugin rewrote resolved `ask` rules to `allow` so its own review, not a
+ * prompt, decided each call. The same move on v2: every `ask` in an agent's
+ * ruleset becomes `allow`, while explicit `deny` rules stay authoritative. If
+ * the plugin ever fails to load, the transform is not applied and OpenCode's
+ * prompts come back — the safe direction.
+ */
+export function suppressNativePrompts(draft: AgentDraft, agents: Set<string>): void {
+  for (const agent of draft.list()) {
+    if (agents.size > 0 && !agents.has(agent.id)) continue
+    if (!agent.permissions.some((rule) => rule.effect === "ask")) continue
+    draft.update(agent.id, (item) => {
+      item.permissions = item.permissions.map((rule) =>
+        rule.effect === "ask" ? { ...rule, effect: "allow" as const } : rule,
+      )
+    })
+  }
+}
+
 type Entry = {
   rules: PermissionV2Rule[]
   expires: number

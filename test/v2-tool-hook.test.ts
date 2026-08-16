@@ -5,6 +5,7 @@ import { join } from "node:path"
 
 import { hasToolHook, registerAISDKHook } from "../src/v2/api.ts"
 import { installToolHook, projectSessionMessages } from "../src/v2/tool-hook.ts"
+import { suppressNativePrompts } from "../src/v2/rules.ts"
 
 type Hook = (event: any) => Promise<void> | void
 
@@ -213,5 +214,51 @@ describe("v2 tool vocabulary", () => {
       /unrelated to the task/,
     )
     expect(replies).toHaveLength(0)
+  })
+})
+
+describe("native prompt suppression", () => {
+  function draftOf(agents: Array<{ id: string; permissions: any[] }>) {
+    const items = new Map(agents.map((a) => [a.id, structuredClone(a)]))
+    return {
+      draft: {
+        list: () => [...items.values()],
+        get: (id: string) => items.get(id),
+        default: () => undefined,
+        update: (id: string, update: (item: any) => void) => {
+          const item = items.get(id)
+          if (item) update(item)
+        },
+        remove: (id: string) => items.delete(id),
+      } as any,
+      items,
+    }
+  }
+
+  test("turns ask into allow and leaves deny authoritative", () => {
+    const { draft, items } = draftOf([
+      {
+        id: "build",
+        permissions: [
+          { action: "*", resource: "*", effect: "ask" },
+          { action: "shell", resource: "rm -rf *", effect: "deny" },
+        ],
+      },
+    ])
+    suppressNativePrompts(draft, new Set())
+    expect(items.get("build")!.permissions).toEqual([
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "shell", resource: "rm -rf *", effect: "deny" },
+    ])
+  })
+
+  test("only touches the governed agents", () => {
+    const { draft, items } = draftOf([
+      { id: "build", permissions: [{ action: "*", resource: "*", effect: "ask" }] },
+      { id: "plan", permissions: [{ action: "*", resource: "*", effect: "ask" }] },
+    ])
+    suppressNativePrompts(draft, new Set(["build"]))
+    expect(items.get("build")!.permissions[0].effect).toBe("allow")
+    expect(items.get("plan")!.permissions[0].effect).toBe("ask")
   })
 })

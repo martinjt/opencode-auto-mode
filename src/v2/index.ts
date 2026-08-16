@@ -7,7 +7,7 @@ import { CACHE_TTL_MS, DEFAULT_REVIEW_TIMEOUT_MS, REVIEWER_PROMPT_URL, errorMess
 import { hasToolHook, registerAISDKHook, type PluginContextLike } from "./api.ts"
 import { makeGate, type GateLog } from "./intercept.ts"
 import { requestReview } from "./review.ts"
-import { makeRuleStore } from "./rules.ts"
+import { makeRuleStore, suppressNativePrompts } from "./rules.ts"
 import { installToolHook } from "./tool-hook.ts"
 
 const PLUGIN_ID = "opencode-auto-mode"
@@ -102,7 +102,14 @@ export const plugin = {
         if (wrapForGating) event.language = wrapForGating(underlying)
       })
 
+    const governed = new Set(stringListOption(options, "agents"))
+
     if (hasToolHook(ctx)) {
+      if (boolOption(options, "suppressPrompts", true)) {
+        await ctx.agent.transform((draft) => {
+          suppressNativePrompts(draft, governed)
+        })
+      }
       if (reviewerModel) await captureReviewer()
       await installToolHook(ctx, {
         workspace,
@@ -130,7 +137,7 @@ export const plugin = {
     const rules = makeRuleStore({
       ttlMs: numberOption(options, "ruleTtlMs", DEFAULT_RULE_TTL_MS, 5_000, 600_000),
       base: basePosture(typeof options.fallback === "string" ? options.fallback : "ask"),
-      agents: new Set(stringListOption(options, "agents")),
+      agents: governed,
     })
     await ctx.agent.transform((draft) => {
       rules.apply(draft)

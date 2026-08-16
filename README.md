@@ -45,33 +45,46 @@ The recommended base configuration keeps `"permission": {"*": "ask"}` outside th
 
 ## OpenCode v2
 
-OpenCode v2 does not run v1 plugins, and its plugin context exposes no tool-execution or permission hook, so `tool.execute.before` has no v2 equivalent — legacy hook names register successfully and are then never called. The package therefore ships a second entrypoint, `opencode-auto-mode/v2` (`src/v2/index.ts`), which reaches the same three tiers through the hooks v2 does expose.
+OpenCode v2 does not run v1 plugins: legacy hook names register successfully and are then never called. The package ships a second entrypoint, `opencode-auto-mode/v2` (`src/v2/index.ts`), which reaches the same three tiers through the v2 plugin context.
 
-### How the v2 entry works
+That context is still moving. Shipping v2 builds (`opencode2`, `next` channel) expose a `tool` domain, a `session` domain and `aisdk.hook(name, callback)`; the published `@opencode-ai/plugin` beta typings expose nine domains and `aisdk.language(callback)` with no tool hook at all. The entrypoint detects which it has at setup and installs the better of two paths.
 
-The decision point moves to the language-model boundary. `ctx.aisdk.language` wraps the model serving the session; each tool call the model emits is held while the classifier runs, and the verdict is written into the agent's permission ruleset through `ctx.agent.transform` before the call is released. Because v2 resolves an agent's ruleset on every permission assertion, the rule written milliseconds earlier is the one the tool observes.
+### Path 1 — the tool-execution hook (preferred)
 
-| Concern | v1 | v2 |
-| --- | --- | --- |
-| Interception point | `tool.execute.before` | wrapped `LanguageModelV3` |
-| Enforcement | throw from the hook | `allow` / `deny` rule recorded before the call runs |
-| Blocked-call reason | thrown error text | rewritten into the tool result on the next request |
-| Reviewer | hidden `auto-reviewer` subagent | direct model call (session model by default) |
-| Reviewer context | rebuilt from the session API | read from the request the model was about to receive |
+When the build exposes `ctx.tool.hook`, the plugin is a direct port of the v1 design:
 
-Two consequences worth knowing:
+```ts
+ctx.tool.hook("execute.before", async (event) => { /* classify; throw to block */ })
+```
 
-- **Reasons take one turn to surface.** v2 flattens every permission failure into a generic per-tool message (`Unable to execute command: …`), discarding both the block reason and the fact that it was a permission decision. The plugin records the reason and rewrites that tool result on the next request, so the model reads `Blocked by auto mode: <reason>` where it would otherwise read the generic string.
-- **Some calls cannot be targeted.** A rule needs an action and an exact resource. Tools outside the built-in set (MCP tools, for example), operations whose resource contains `*` or `?`, and calls nested inside a single `execute` invocation are left to the configuration already in place rather than being silently allowed.
+The classifier runs before the tool starts and blocks by throwing, so the reason lands in the tool error the model reads — exactly as in v1. Reviewer context comes from `ctx.session.hook("context")`, which carries the request's full message list, and the reviewer turn runs through `ctx.session.generate` (the session's own model) unless a `model` is configured.
+
+As in v1, the plugin also rewrites resolved `ask` rules to `allow` through `ctx.agent.transform` so its review, rather than a prompt, decides each call; explicit `deny` rules stay authoritative. Set `"suppressPrompts": false` to keep OpenCode's own prompts alongside the review.
+
+### Path 2 — the language-model boundary (fallback)
+
+Without a tool domain, the decision moves to the model boundary: `ctx.aisdk.language` wraps the model serving the session, each tool call is held while the classifier runs, and the verdict is written into the agent's permission ruleset via `ctx.agent.transform` before the call is released. v2 re-resolves an agent's ruleset on every permission assertion, so the rule written milliseconds earlier is the one the tool sees.
+
+This path has two limits the hook path does not:
+
+- **Reasons arrive a turn late.** v2 flattens every permission failure into a generic per-tool message (`Unable to execute command: …`), discarding the reason and even the fact that it was a permission decision. The plugin records the reason and rewrites that tool result on the next request, so the model reads `Blocked by auto mode: <reason>`.
+- **Some calls cannot be targeted.** A rule needs an action and an exact resource, so tools outside the built-in set, resources containing `*` or `?`, and calls nested inside one `execute` invocation are left to the configuration already in place rather than being auto-approved.
+
+### v2 tool names
+
+v2 renamed several built-ins — `bash` became `shell`, `task` became `subagent`. The classifier canonicalises those names before the static tiers run, so a `shell` call still gets command analysis, the hard-block list and the conservative allow list; messages keep the name the build actually used.
 
 ### Install on v2
 
-v2 resolves a bare package name to the package's main entrypoint, which is the v1 plugin, so the v2 entry is referenced by path. Either point at it directly in `opencode.json`:
+v2 resolves a bare package name to the package's main entrypoint, which is the v1 plugin, so reference the v2 entry by path in `opencode.json`:
 
 ```json
 {
   "plugins": [
-    { "package": "file:///absolute/path/to/opencode-auto-mode/src/v2/index.ts", "options": { "enabled": true } }
+    {
+      "package": "/absolute/path/to/opencode-auto-mode/src/v2/index.ts",
+      "options": { "enabled": true }
+    }
   ]
 }
 ```
@@ -82,9 +95,15 @@ or re-export it from a project-local plugin file, `.opencode/plugin/auto-mode.ts
 export { default } from "opencode-auto-mode/v2"
 ```
 
-v2 options (all optional): `enabled`, `model` (`"provider/model"`, defaults to the session model), `timeoutMs`, `cacheTtlMs`, `ruleTtlMs`, `agents` (agent ids to govern; default all), `workspace` (project root; defaults to the server's working directory), and `fallback` — `"ask"` (default) leaves unreviewed operations to your configured rules, `"deny"` installs a catch-all deny underneath them.
+Options (all optional): `enabled`, `suppressPrompts` (path 1; default true), `model` (`"provider/model"`), `timeoutMs`, `cacheTtlMs`, `workspace` (project root; defaults to the server's working directory), plus `ruleTtlMs`, `agents` and `fallback` which apply to path 2 only. `fallback: "ask"` (default) leaves unreviewed operations to your configured rules; `"deny"` installs a catch-all deny underneath them.
 
-Set `OPENCODE_AUTO_MODE_DEBUG=1` to log every decision. v2 swallows plugin load failures silently, so check the server log if nothing appears.
+Note that `model` only takes effect once that model has been resolved for some session, because the reviewer model is captured through the AI SDK hook. Leave it unset to review with the session's own model.
+
+### Operating notes
+
+- Plugins load per location, and the server caches the plugin module by the **entrypoint's** mtime only. Editing a file the entrypoint imports is not enough: `touch src/v2/index.ts`, or restart the background server with `opencode2 service restart`, to pick up changes.
+- Restarting the background server re-inherits the environment of whatever restarts it. If the server was started with provider credentials or `OPENCODE_CONFIG` in its environment, restart it the same way or it will come back without them.
+- v2 swallows plugin load failures; check the server log (`~/.local/share/opencode/log/opencode.log`) for `failed to load plugin` if nothing seems to happen. Set `OPENCODE_AUTO_MODE_DEBUG=1` to log every decision.
 
 ## Installation
 
