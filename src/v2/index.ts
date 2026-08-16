@@ -2,30 +2,26 @@ import { readFile, realpath } from "node:fs/promises"
 import { resolve } from "node:path"
 
 import type { LanguageModelV3 } from "@ai-sdk/provider"
-import type { Plugin } from "@opencode-ai/plugin/v2/promise"
-import type { PermissionV2Rule } from "@opencode-ai/sdk/v2/types"
 
 import { CACHE_TTL_MS, DEFAULT_REVIEW_TIMEOUT_MS, REVIEWER_PROMPT_URL, errorMessage, parseModel } from "../core.ts"
+import { hasToolHook, registerAISDKHook, type PluginContextLike } from "./api.ts"
 import { makeGate, type GateLog } from "./intercept.ts"
+import { requestReview } from "./review.ts"
 import { makeRuleStore } from "./rules.ts"
+import { installToolHook } from "./tool-hook.ts"
 
 const PLUGIN_ID = "opencode-auto-mode"
 const DEFAULT_RULE_TTL_MS = 120_000
 
 /**
- * Actions covered by the catch-all deny when `fallback: "deny"` is configured.
- * The resource is `**` rather than `*`: the tool registry removes any tool whose
- * last matching rule is an exact `*` deny, which would hide the tool from the
- * model instead of gating it.
+ * Actions covered by the catch-all deny when `fallback: "deny"` is configured on
+ * the permission-rule path. The resource is `**` rather than `*`: the tool
+ * registry removes any tool whose last matching rule is an exact `*` deny, which
+ * would hide the tool from the model instead of gating it.
  */
 const GOVERNED_ACTIONS = ["bash", "edit", "read", "webfetch", "websearch", "glob", "grep", "skill"]
 
-/**
- * `define` from `@opencode-ai/plugin/v2/promise` is an identity function. Keeping
- * a local copy leaves every import in this entrypoint type-only, so the plugin
- * file needs no installed dependencies at the path OpenCode imports it from.
- */
-const define = (plugin: Plugin): Plugin => plugin
+type Rule = { action: string; resource: string; effect: "allow" | "ask" | "deny" }
 
 function boolOption(options: Record<string, unknown>, key: string, fallback: boolean): boolean {
   const value = options[key]
@@ -51,24 +47,25 @@ function stringListOption(options: Record<string, unknown>, key: string): string
   return value as string[]
 }
 
-function basePosture(mode: string): PermissionV2Rule[] {
+function basePosture(mode: string): Rule[] {
   if (mode === "ask") return []
   if (mode !== "deny") throw new TypeError("auto mode option 'fallback' must be 'ask' or 'deny'")
   return GOVERNED_ACTIONS.map((action) => ({ action, resource: "**", effect: "deny" }))
 }
 
-export default define({
+export const plugin = {
   id: PLUGIN_ID,
-  setup: async (ctx) => {
+  setup: async (context: unknown) => {
+    const ctx = context as PluginContextLike
     const options = (ctx.options ?? {}) as Record<string, unknown>
     if (!boolOption(options, "enabled", true)) return
 
-    const modelSpec =
-      (typeof options.model === "string" ? options.model.trim() : "") ||
-      process.env.OPENCODE_AUTO_REVIEWER_MODEL?.trim()
     if (options.model !== undefined && typeof options.model !== "string") {
       throw new TypeError("auto mode option 'model' must use the string format 'provider/model'")
     }
+    const modelSpec =
+      (typeof options.model === "string" ? options.model.trim() : "") ||
+      process.env.OPENCODE_AUTO_REVIEWER_MODEL?.trim()
     const reviewerModel = parseModel(modelSpec)
     if (modelSpec && !reviewerModel) {
       throw new TypeError("auto mode option 'model' must use the format 'provider/model'")
@@ -79,6 +76,8 @@ export default define({
 
     const workspace = typeof options.workspace === "string" && options.workspace ? options.workspace : process.cwd()
     const canonicalWorkspace = await realpath(workspace).catch(() => resolve(workspace))
+    const reviewTimeoutMs = numberOption(options, "timeoutMs", DEFAULT_REVIEW_TIMEOUT_MS, 1_000, 300_000)
+    const cacheTtlMs = numberOption(options, "cacheTtlMs", CACHE_TTL_MS, 0, 3_600_000)
 
     const log: GateLog = (level, message, extra) => {
       const line = `[${PLUGIN_ID}] ${message}${extra ? ` ${JSON.stringify(extra)}` : ""}`
@@ -86,44 +85,80 @@ export default define({
       else if (process.env.OPENCODE_AUTO_MODE_DEBUG) console.error(line)
     }
 
+    // A configured reviewer model is captured, never wrapped: reviewer turns
+    // must not re-enter the classifier.
+    let reviewer: LanguageModelV3 | undefined
+    const captureReviewer = async (wrapForGating?: (model: LanguageModelV3) => LanguageModelV3) =>
+      registerAISDKHook(ctx, "language", (event: any) => {
+        const underlying = event?.language
+        if (!underlying) return
+        if (
+          reviewerModel &&
+          (event.model?.providerID ?? event.model?.provider) === reviewerModel.providerID &&
+          event.model?.id === reviewerModel.modelID
+        ) {
+          reviewer = underlying
+        }
+        if (wrapForGating) event.language = wrapForGating(underlying)
+      })
+
+    if (hasToolHook(ctx)) {
+      if (reviewerModel) await captureReviewer()
+      await installToolHook(ctx, {
+        workspace,
+        canonicalWorkspace,
+        cacheTtlMs,
+        log,
+        ...(reviewerModel
+          ? {
+              review: async (request: string) => {
+                if (!reviewer) throw new Error(`reviewer model ${modelSpec} has not been resolved yet`)
+                return requestReview(reviewer, reviewerPrompt, request, reviewTimeoutMs)
+              },
+            }
+          : {}),
+      })
+      log("info", "auto mode installed on the tool-execution hook", {
+        workspace: canonicalWorkspace,
+        reviewer: modelSpec || "session model",
+      })
+      return
+    }
+
+    // Fallback for builds whose plugin context has no tool domain: decide at the
+    // language-model boundary and record the verdict as a permission rule.
     const rules = makeRuleStore({
       ttlMs: numberOption(options, "ruleTtlMs", DEFAULT_RULE_TTL_MS, 5_000, 600_000),
       base: basePosture(typeof options.fallback === "string" ? options.fallback : "ask"),
       agents: new Set(stringListOption(options, "agents")),
     })
-
     await ctx.agent.transform((draft) => {
       rules.apply(draft)
     })
 
-    let reviewer: LanguageModelV3 | undefined
     const gate = makeGate({
       workspace,
       canonicalWorkspace,
       reviewerPrompt,
-      reviewTimeoutMs: numberOption(options, "timeoutMs", DEFAULT_REVIEW_TIMEOUT_MS, 1_000, 300_000),
-      cacheTtlMs: numberOption(options, "cacheTtlMs", CACHE_TTL_MS, 0, 3_600_000),
+      reviewTimeoutMs,
+      cacheTtlMs,
       rules,
       reload: () => ctx.agent.reload(),
       reviewer: () => reviewer,
       log,
     })
 
-    await ctx.aisdk.language((event) => {
-      const underlying = event.language
-      if (!underlying) return
-      // Capture the unwrapped reviewer model first; reviewer turns must not be gated.
-      if (reviewerModel && event.model.providerID === reviewerModel.providerID && event.model.id === reviewerModel.modelID) {
-        reviewer = underlying
-      }
-      event.language = gate.wrap(underlying)
-    })
-
-    log("info", "auto mode installed", {
+    const installed = await captureReviewer((model) => gate.wrap(model))
+    if (!installed) {
+      throw new Error("auto mode found neither a tool-execution hook nor an AI SDK hook on this OpenCode build")
+    }
+    log("info", "auto mode installed on the language-model boundary", {
       workspace: canonicalWorkspace,
       reviewer: modelSpec || "session model",
     })
   },
-})
+}
+
+export default plugin
 
 export { makeGate, makeRuleStore, errorMessage }
