@@ -2,7 +2,7 @@ import { readFile, realpath } from "node:fs/promises"
 import { resolve } from "node:path"
 
 import type { LanguageModelV3 } from "@ai-sdk/provider"
-import { define } from "@opencode-ai/plugin/v2/promise"
+import type { Plugin } from "@opencode-ai/plugin/v2/promise"
 import type { PermissionV2Rule } from "@opencode-ai/sdk/v2/types"
 
 import { CACHE_TTL_MS, DEFAULT_REVIEW_TIMEOUT_MS, REVIEWER_PROMPT_URL, errorMessage, parseModel } from "../core.ts"
@@ -19,6 +19,13 @@ const DEFAULT_RULE_TTL_MS = 120_000
  * model instead of gating it.
  */
 const GOVERNED_ACTIONS = ["bash", "edit", "read", "webfetch", "websearch", "glob", "grep", "skill"]
+
+/**
+ * `define` from `@opencode-ai/plugin/v2/promise` is an identity function. Keeping
+ * a local copy leaves every import in this entrypoint type-only, so the plugin
+ * file needs no installed dependencies at the path OpenCode imports it from.
+ */
+const define = (plugin: Plugin): Plugin => plugin
 
 function boolOption(options: Record<string, unknown>, key: string, fallback: boolean): boolean {
   const value = options[key]
